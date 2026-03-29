@@ -13,6 +13,7 @@ class PostPayload(BaseModel):
     platforms: List[str]
     location_id: Optional[str] = None
     shorts_title: Optional[str] = "Noticia"
+    account_id: Optional[str] = "economika"
 
 class SchedulePayload(BaseModel):
     posts: List[PostPayload]

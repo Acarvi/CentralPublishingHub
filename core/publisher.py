@@ -9,6 +9,17 @@ from core.logger import log_print, trigger_token_setup
 from core.youtube_uploader import upload_short
 
 SCHEDULED_POSTS_FILE = os.path.join(DATA_DIR, "scheduled_posts.json")
+ACCOUNTS_DB_FILE = os.path.join(DATA_DIR, "accounts_db.json")
+
+def load_accounts():
+    if os.path.exists(ACCOUNTS_DB_FILE):
+        with open(ACCOUNTS_DB_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def get_account_credentials(account_id: str):
+    accounts = load_accounts()
+    return accounts.get(account_id)
 
 def load_scheduled_posts():
     if os.path.exists(SCHEDULED_POSTS_FILE):
@@ -210,9 +221,18 @@ def upload_facebook_video(video_path_or_url, caption, access_token, page_id, is_
 
 def publish_item_local(post: dict):
     """Executes the complete publishing flow for a single item"""
-    access_token = get_env_or_raise("META_ACCESS_TOKEN")
-    ig_user_id = get_env_or_raise("IG_USER_ID")
-    fb_page_id = get_env_or_raise("FB_PAGE_ID")
+    account_id = post.get('account_id', 'economika')
+    creds = get_account_credentials(account_id)
+    
+    if not creds:
+        # Fallback to env vars if not in DB
+        access_token = get_env_or_raise("META_ACCESS_TOKEN")
+        ig_user_id = get_env_or_raise("IG_USER_ID")
+        fb_page_id = get_env_or_raise("FB_PAGE_ID")
+    else:
+        access_token = creds.get("instagram_access_token")
+        ig_user_id = creds.get("instagram_user_id")
+        fb_page_id = creds.get("facebook_page_id")
     
     platforms = post.get('platforms', [])
     video_path = post.get('video_path')
