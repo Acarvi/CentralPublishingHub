@@ -44,3 +44,8 @@ def schedule_batch(payload: SchedulePayload, background_tasks: BackgroundTasks):
 def get_queue():
     pending = publisher.get_queue()
     return {"pending": pending}
+
+@router.get("/locations")
+def search_locations(q: str, account_id: str = "economika"):
+    results = publisher.search_locations(q, account_id)
+    return {"results": results}

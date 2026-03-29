@@ -230,9 +230,9 @@ def publish_item_local(post: dict):
         ig_user_id = get_env_or_raise("IG_USER_ID")
         fb_page_id = get_env_or_raise("FB_PAGE_ID")
     else:
-        access_token = creds.get("instagram_access_token")
-        ig_user_id = creds.get("instagram_user_id")
-        fb_page_id = creds.get("facebook_page_id")
+        access_token = creds.get("access_token")
+        ig_user_id = creds.get("ig_user_id")
+        fb_page_id = creds.get("fb_page_id")
     
     platforms = post.get('platforms', [])
     video_path = post.get('video_path')
@@ -254,3 +254,15 @@ def publish_item_local(post: dict):
         upload_facebook_video(video_path or video_url, None, access_token, fb_page_id, is_story=True)
     if 'youtube_shorts' in platforms and video_path:
         upload_short(video_path, post.get('shorts_title', 'Noticia'), post['caption'])
+
+def search_locations(query: str, account_id: str = "economika"):
+    creds = get_account_credentials(account_id)
+    token = creds.get("access_token") if creds else get_env_or_raise("META_ACCESS_TOKEN")
+    
+    url = f"https://graph.facebook.com/v22.0/pages/search?q={query}&type=adlocation&access_token={token}"
+    try:
+        res = requests.get(url).json()
+        return res.get("data", [])
+    except Exception as e:
+        log_print(f"Error searching locations: {e}", "ERROR")
+        return []
