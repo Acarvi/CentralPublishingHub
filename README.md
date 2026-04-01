@@ -21,9 +21,14 @@ The **Central Publishing Hub** is a FastAPI-based service designed to centralize
 ## Setup
 1. Copy `.env.example` to `.env` and fill in credentials.
 2. Install dependencies: `pip install -r requirements.txt`.
-3. Run service: `python main.py` (Default: port 8001).
+3. Run service (OBLIGATORIO para EconomikaNoticias):
+   ```bash
+   python main.py
+   ```
+   (El servidor arrancará en el puerto 8000).
 
-## Architecture & Skills
+## API Endpoints
+...
 This project follows the **Skills Architecture** protocol (.agent/skills/).
 - [Tests](.agent/skills/skill_testing.md): Pytest + Coverage.
 - [Documentation](.agent/skills/skill_documentation.md): Maintenance rules.

@@ -36,9 +36,24 @@ def schedule_batch(payload: SchedulePayload, background_tasks: BackgroundTasks):
     Simulates the queuing of posts.
     """
     # For a robust system, this should write to a DB or a Queue (Redis, etc.)
-    # For now, we will add them to the local scheduled JSON or memory if we retain the Economika pattern.
-    publisher.add_to_queue([p.dict() for p in payload.posts])
-    return {"status": "ok", "queued": len(payload.posts)}
+    # For now, we will add them to the local scheduled JSON or memory        # Call the publisher to queue the items
+    try:
+        publisher.add_to_queue([p.model_dump() for p in payload.posts])
+        return {"status": "success", "message": f"{len(payload.posts)} posts scheduled."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/publish-now")
+async def publish_now_api(payload: PostPayload):
+    """
+    Endpoint to publish an item immediately across platforms.
+    """
+    try:
+        # Call the publisher's local publish function
+        result = publisher.publish_item_local(payload.model_dump())
+        return {"status": "success", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/queue")
 def get_queue():
