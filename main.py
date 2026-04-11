@@ -9,10 +9,14 @@ app = FastAPI(
 
 app.include_router(publish.router, prefix="/api/v1")
 
+@app.get("/")
+def read_root():
+    return {"status": "Central Publishing Hub Running"}
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "CentralPublishingHub"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
