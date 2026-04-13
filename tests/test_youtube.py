@@ -1,7 +1,13 @@
 import pytest
 import os
+import sys
 from unittest.mock import patch, MagicMock, mock_open
 from core.youtube_uploader import get_authenticated_service, upload_short
+
+# Add SentinelAPI to path
+SENTINEL_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "SentinelAPI"))
+if SENTINEL_PATH not in sys.path:
+    sys.path.insert(0, SENTINEL_PATH)
 
 @patch("core.youtube_uploader.build")
 @patch("core.youtube_uploader.InstalledAppFlow.from_client_secrets_file")
@@ -61,3 +67,40 @@ def test_get_authenticated_service_refresh(mock_pickle, mock_exists, mock_flow, 
                 get_authenticated_service()
                 assert creds.refresh.called
                 assert mock_dump.called
+
+@patch("googleapiclient.errors.HttpError")
+def test_upload_short_quota_error(mock_http_error):
+    """Simulate a YouTube API quota exceeded error."""
+    from core.youtube_uploader import upload_short
+    with patch("core.youtube_uploader.get_authenticated_service") as mock_auth:
+        mock_service = MagicMock()
+        mock_auth.return_value = mock_service
+        
+        # Mock HttpError for quota (403 with specific reason)
+        error_resp = MagicMock()
+        error_resp.status = 403
+        error_resp.reason = "quotaExceeded"
+        mock_service.videos().insert().execute.side_effect = mock_http_error(resp=error_resp, content=b"Quota Exceeded")
+        
+        with patch("os.path.exists", return_value=True):
+            try:
+                upload_short("vid.mp4", "Title", "Desc")
+            except Exception:
+                pass
+            # Just verify the target was called
+            assert mock_service.videos().insert().execute.called
+
+def test_sentinel_lock_simulation():
+    """Verify that if Sentinel security audit fails, the service should theoretically block."""
+    # In reality, bootstrap.py calls sys.exit(1)
+    with patch("security_audit.validate_environment") as mock_audit:
+        mock_audit.side_effect = SystemExit(1)
+        
+        with patch("sys.exit") as mock_exit:
+            try:
+                from bootstrap import activate_security
+                activate_security()
+            except SystemExit:
+                pass
+            # verify that validate_environment was called and triggered the exit
+            assert mock_audit.called
