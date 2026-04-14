@@ -9,7 +9,7 @@ try:
     from bootstrap import activate_security
     activate_security()
 except ImportError:
-    print("⚠️ Warning: SentinelAPI module not found. Proceeding with caution.")
+    print("Warning: SentinelAPI module not found. Proceeding with caution.")
 
 from fastapi import FastAPI
 from routers import publish
