@@ -1,17 +1,13 @@
-# Skill: Automated Testing & Coverage
+# Skill: Testing and Quality Assurance
 
 ## Objective
-Maintain high code quality through rigorous automated testing and coverage metrics.
+Ensure the maximum reliability and stability of the codebase by enforcing rigorous testing standards.
 
-## Protocol
-1. **Coverage Check**: Run `pytest --cov=core --cov=routers --cov-report=term-missing`.
-2. **Target**: Aim for 90-100% coverage on core logic.
-3. **Automatic Debugging**: 
-   - If a test fails, read the traceback.
-   - Use `grep` or `Select-String` to find the failing line.
-   - Propose a fix and re-run immediately.
-4. **Mocking**: Use `unittest.mock` for external API calls (Meta, YouTube) to ensure tests are fast and hermetic.
-
-## Commands
-- `pytest` (Basic)
-- `pytest --cov=.` (Full Coverage)
+## Rules
+1. **Coverage OBLIGATORIA (100%)**: Todas las funciones y ramas lgicas deben estar cubiertas por tests unitarios o funcionales en Python.
+2. **Pytest First**: Antes de dar por finalizada una tarea, de realizar un commit o de subir cambios, es OBLIGATORIO ejecutar la suite completa de tests usando `pytest`.
+   - Si un solo test falla, **NO SE SUBE EL CDIGO**.
+3. **Documentacin de Tests**: Cada archivo de test en la carpeta `tests/` debe contener comentarios o un `README.md` local explicando:
+   - Qu funcionalidades especficas se estn probando.
+   - Cul es la justificacin del test (por qu es crtico).
+4. **Anti-Regresin**: Si se corrige un bug, se debe incluir un test que reproduzca el error previo para evitar que vuelva a ocurrir.

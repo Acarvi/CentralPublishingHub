@@ -12,6 +12,11 @@ The **Central Publishing Hub** is a FastAPI-based service designed to centralize
 - **Location Search**: Integrated Instagram location tagging.
 - **Temporary Hosting**: Automatic media hosting via Gofile/Uguu/Catbox for Meta API compatibility.
 
+## Meta/Instagram Media Hosting
+For Instagram publishing, CentralPublishingHub owns public URL resolution. Callers such as EconomikaNoticias should send `video_path` when the Hub can access the local file, or `video_url` when media is already hosted. The Hub uses temporary hosting adapters in this order: Gofile, Uguu, Catbox.
+
+See [docs/meta-instagram-hosting.md](docs/meta-instagram-hosting.md) for the formal contract, aliases, and Feed/Post status.
+
 ## API Endpoints
 - `POST /api/v1/publish`: Immediate publishing.
 - `POST /api/v1/schedule`: Add posts to the queue.
