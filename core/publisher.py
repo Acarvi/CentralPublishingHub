@@ -10,6 +10,20 @@ from core.youtube_uploader import upload_short
 
 SCHEDULED_POSTS_FILE = os.path.join(DATA_DIR, "scheduled_posts.json")
 ACCOUNTS_DB_FILE = os.path.join(DATA_DIR, "accounts_db.json")
+INSTAGRAM_PUBLIC_URL_TARGETS = {
+    "instagram_reel",
+    "instagram_story",
+    "instagram_feed",
+    "instagram_post",
+}
+PLATFORM_ALIASES = {
+    "instagram": "instagram_reel",
+    "reel": "instagram_reel",
+    "story": "instagram_story",
+    "feed": "instagram_feed",
+    "post": "instagram_feed",
+    "instagram_post": "instagram_feed",
+}
 
 def load_accounts():
     if os.path.exists(ACCOUNTS_DB_FILE):
@@ -41,6 +55,43 @@ def add_to_queue(new_posts: list):
 def get_queue():
     posts = load_scheduled_posts()
     return [p for p in posts if p.get('status') == 'pending']
+
+def normalize_platforms(platforms: list[str]) -> list[str]:
+    return [PLATFORM_ALIASES.get(platform, platform) for platform in platforms]
+
+def requires_public_url(platforms: list[str]) -> bool:
+    normalized_platforms = normalize_platforms(platforms)
+    return any(platform in INSTAGRAM_PUBLIC_URL_TARGETS for platform in normalized_platforms)
+
+def resolve_public_media_url(post: dict) -> tuple[str | None, dict | None]:
+    """
+    Resolve media into a public URL for Meta/Instagram Graph container creation.
+
+    Returns (video_url, error).
+    """
+    video_url = post.get("video_url")
+    if video_url:
+        return video_url, None
+
+    platforms = normalize_platforms(post.get("platforms", []))
+    if not requires_public_url(platforms):
+        return None, None
+
+    video_path = post.get("video_path")
+    if not video_path:
+        return None, {
+            "error": "PUBLIC_URL_REQUIRED",
+            "details": "Instagram targets require video_url or uploadable video_path",
+        }
+
+    uploaded_url = upload_to_temporary_host(video_path)
+    if not uploaded_url:
+        return None, {
+            "error": "TEMPORARY_UPLOAD_FAILED",
+            "details": "Temporary hosting did not return a public URL",
+        }
+
+    return uploaded_url, None
 
 def upload_to_temporary_host(file_path):
     """Uploads a file to get a public URL. Fallback: Gofile -> Uguu -> Catbox."""
@@ -221,6 +272,18 @@ def upload_facebook_video(video_path_or_url, caption, access_token, page_id, is_
 
 def publish_item_local(post: dict):
     """Executes the complete publishing flow for a single item"""
+    platforms = normalize_platforms(post.get('platforms', []))
+    post["platforms"] = platforms
+    video_path = post.get('video_path')
+    video_url, media_error = resolve_public_media_url(post)
+    if media_error:
+        log_print(media_error["details"], "ERROR")
+        return {
+            "status": "error",
+            "error": media_error["error"],
+            "details": media_error["details"],
+        }
+
     account_id = post.get('account_id', 'economika')
     creds = get_account_credentials(account_id)
     
@@ -234,26 +297,33 @@ def publish_item_local(post: dict):
         ig_user_id = creds.get("ig_user_id")
         fb_page_id = creds.get("fb_page_id")
     
-    platforms = post.get('platforms', [])
-    video_path = post.get('video_path')
-    video_url = post.get('video_url')
-    
-    if video_path and not video_url:
-        video_url = upload_to_temporary_host(video_path)
-        if not video_url:
-            log_print("No temporary URL could be generated.", "ERROR")
-            return
-            
+    results = []
+
     if 'instagram_reel' in platforms:
-        _upload_to_ig(video_url, post['caption'], access_token, ig_user_id, "REELS", location_id=post.get('location_id'))
+        result = _upload_to_ig(video_url, post['caption'], access_token, ig_user_id, "REELS", location_id=post.get('location_id'))
+        results.append({"platform": "instagram_reel", "success": bool(result), "result": result})
     if 'instagram_story' in platforms:
-        _upload_to_ig(video_url, None, access_token, ig_user_id, "STORIES", location_id=post.get('location_id'))
+        result = _upload_to_ig(video_url, None, access_token, ig_user_id, "STORIES", location_id=post.get('location_id'))
+        results.append({"platform": "instagram_story", "success": bool(result), "result": result})
+    if 'instagram_feed' in platforms:
+        results.append({
+            "platform": "instagram_feed",
+            "success": False,
+            "error": "NOT_IMPLEMENTED",
+            "details": "Instagram Feed/Post publishing is a planned target and is not implemented yet.",
+        })
     if 'facebook_reel' in platforms:
-        upload_facebook_video(video_path or video_url, post['caption'], access_token, fb_page_id, is_story=False)
+        result = upload_facebook_video(video_path or video_url, post['caption'], access_token, fb_page_id, is_story=False)
+        results.append({"platform": "facebook_reel", "success": bool(result), "result": result})
     if 'facebook_story' in platforms:
-        upload_facebook_video(video_path or video_url, None, access_token, fb_page_id, is_story=True)
+        result = upload_facebook_video(video_path or video_url, None, access_token, fb_page_id, is_story=True)
+        results.append({"platform": "facebook_story", "success": bool(result), "result": result})
     if 'youtube_shorts' in platforms and video_path:
-        upload_short(video_path, post.get('shorts_title', 'Noticia'), post['caption'])
+        result = upload_short(video_path, post.get('shorts_title', 'Noticia'), post['caption'])
+        results.append({"platform": "youtube_shorts", "success": True, "result": result})
+
+    status = "success" if all(item.get("success") for item in results) else "partial_failed"
+    return {"status": status, "results": results}
 
 def search_locations(query: str, account_id: str = "economika"):
     creds = get_account_credentials(account_id)

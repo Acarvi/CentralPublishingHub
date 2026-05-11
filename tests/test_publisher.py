@@ -6,7 +6,8 @@ from unittest.mock import patch, MagicMock, mock_open
 from core.publisher import (
     load_accounts, get_account_credentials, load_scheduled_posts,
     save_scheduled_posts, add_to_queue, get_queue, upload_to_temporary_host,
-    publish_item_local, search_locations
+    publish_item_local, search_locations, requires_public_url,
+    resolve_public_media_url, normalize_platforms
 )
 
 @patch("os.path.exists", return_value=False)
@@ -58,6 +59,70 @@ def test_get_queue(mock_load):
     assert len(queue) == 1
     assert queue[0]["status"] == "pending"
 
+def test_requires_public_url_for_instagram_targets():
+    assert requires_public_url(["instagram_reel"]) is True
+    assert requires_public_url(["instagram_story"]) is True
+    assert requires_public_url(["instagram_feed"]) is True
+    assert requires_public_url(["youtube_shorts"]) is False
+
+def test_normalize_platform_aliases():
+    assert normalize_platforms(["instagram", "reel", "story", "feed", "post", "instagram_post"]) == [
+        "instagram_reel",
+        "instagram_reel",
+        "instagram_story",
+        "instagram_feed",
+        "instagram_feed",
+        "instagram_feed",
+    ]
+
+@patch("core.publisher.upload_to_temporary_host")
+def test_resolve_public_media_url_uses_existing_url(mock_upload):
+    url, error = resolve_public_media_url({
+        "video_url": "https://cdn.example/video.mp4",
+        "video_path": "local.mp4",
+        "platforms": ["instagram_reel"],
+    })
+    assert url == "https://cdn.example/video.mp4"
+    assert error is None
+    mock_upload.assert_not_called()
+
+@patch("core.publisher.upload_to_temporary_host", return_value="https://temp.example/video.mp4")
+def test_resolve_public_media_url_uploads_for_instagram_path(mock_upload):
+    url, error = resolve_public_media_url({
+        "video_path": "local.mp4",
+        "platforms": ["instagram_story"],
+    })
+    assert url == "https://temp.example/video.mp4"
+    assert error is None
+    mock_upload.assert_called_once_with("local.mp4")
+
+@patch("core.publisher.upload_to_temporary_host")
+def test_resolve_public_media_url_missing_media_for_instagram(mock_upload):
+    url, error = resolve_public_media_url({"platforms": ["instagram_reel"]})
+    assert url is None
+    assert error["error"] == "PUBLIC_URL_REQUIRED"
+    mock_upload.assert_not_called()
+
+@patch("core.publisher.upload_to_temporary_host", return_value=None)
+def test_resolve_public_media_url_upload_failure(mock_upload):
+    url, error = resolve_public_media_url({
+        "video_path": "local.mp4",
+        "platforms": ["instagram_feed"],
+    })
+    assert url is None
+    assert error["error"] == "TEMPORARY_UPLOAD_FAILED"
+    mock_upload.assert_called_once_with("local.mp4")
+
+@patch("core.publisher.upload_to_temporary_host")
+def test_resolve_public_media_url_does_not_upload_for_youtube(mock_upload):
+    url, error = resolve_public_media_url({
+        "video_path": "local.mp4",
+        "platforms": ["youtube_shorts"],
+    })
+    assert url is None
+    assert error is None
+    mock_upload.assert_not_called()
+
 @patch("requests.get")
 @patch("requests.post")
 def test_upload_to_temporary_host_gofile(mock_post, mock_get):
@@ -98,8 +163,21 @@ def test_upload_to_temporary_host_catbox(mock_post, mock_get):
 @patch("core.publisher.log_print")
 def test_publish_item_local_upload_fail(mock_log, mock_upload, mock_post, mock_get_creds):
     post = {"video_path": "test.mp4", "caption": "test", "platforms": ["instagram_reel"]}
-    publish_item_local(post)
-    mock_log.assert_called_with("No temporary URL could be generated.", "ERROR")
+    result = publish_item_local(post)
+    assert result["status"] == "error"
+    assert result["error"] == "TEMPORARY_UPLOAD_FAILED"
+    mock_log.assert_called_with("Temporary hosting did not return a public URL", "ERROR")
+
+@patch("core.publisher.get_account_credentials")
+@patch("core.publisher._upload_to_ig")
+@patch("core.publisher.log_print")
+def test_publish_item_local_does_not_call_ig_when_url_resolution_fails(mock_log, mock_ig, mock_get_creds):
+    post = {"caption": "test", "platforms": ["instagram_reel"]}
+    result = publish_item_local(post)
+    assert result["status"] == "error"
+    assert result["error"] == "PUBLIC_URL_REQUIRED"
+    mock_ig.assert_not_called()
+    mock_get_creds.assert_not_called()
 
 @patch("requests.post")
 def test_upload_to_ig_error_code_3(mock_post):
