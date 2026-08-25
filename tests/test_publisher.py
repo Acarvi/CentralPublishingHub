@@ -203,6 +203,129 @@ def test_publish_now_with_idempotency_new_operation_after_failure_executes(monke
         assert call_count == 2
 
 
+def test_publish_now_concurrent_requests_execute_single_upload(monkeypatch):
+    """
+    Real CONCURRENT test:
+    - Thread A enters publish_item_local() and blocks on an Event.
+    - While Thread A is executing inside publish_item_local(), Thread B launches with the EXACT SAME idempotency_key.
+    - Thread B acquires reservation lock, sees 'immediate_processing', and enters bounded wait WITHOUT calling publish_item_local.
+    - Release Thread A.
+    - Both threads finish.
+    - Assert:
+      1. publish_item_local was called EXACTLY 1 time (publish_item_local.call_count == 1).
+      2. Exactly 1 record persisted for that idempotency_key.
+      3. Both threads return the exact same canonical execution result.
+    """
+    import tempfile
+    import threading
+    from pathlib import Path
+    from core.publisher import publish_now_with_idempotency, load_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        call_count = 0
+        inside_publish_event = threading.Event()
+        release_publish_event = threading.Event()
+
+        canonical_result = {
+            "status": "success",
+            "results": [
+                {"platform": "instagram_reel", "success": True, "result": {"id": "ig_concurrent_1"}},
+                {"platform": "youtube_shorts", "success": True, "result": {"id": "yt_concurrent_1"}},
+            ],
+        }
+
+        def mock_publish(payload):
+            nonlocal call_count
+            call_count += 1
+            inside_publish_event.set()
+            # Block until test signals release
+            release_publish_event.wait(timeout=5.0)
+            return canonical_result
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish)
+
+        payload_shared = {
+            "caption": "Concurrent Immediate Post",
+            "idempotency_key": "idem-concurrent-exact-key-999",
+            "scheduled_id": "sch-concurrent-1",
+            "client_job_id": "attempt-concurrent-1",
+            "platforms": ["instagram_reel", "youtube_shorts"],
+        }
+
+        results = {}
+
+        def worker_A():
+            results["A"] = publish_now_with_idempotency(payload_shared, wait_timeout_seconds=5.0)
+
+        def worker_B():
+            results["B"] = publish_now_with_idempotency(payload_shared, wait_timeout_seconds=5.0)
+
+        thread_A = threading.Thread(target=worker_A)
+        thread_B = threading.Thread(target=worker_B)
+
+        # 1. Start Thread A (becomes owner)
+        thread_A.start()
+        # Wait until Thread A is confirmed INSIDE publish_item_local()
+        assert inside_publish_event.wait(timeout=3.0)
+
+        # 2. While Thread A is executing, start Thread B with the same idempotency key
+        thread_B.start()
+        # Brief pause to ensure Thread B has hit the reservation lock and entered wait
+        import time
+        time.sleep(0.1)
+
+        # 3. Release Thread A to finish execution and persist result
+        release_publish_event.set()
+
+        thread_A.join(timeout=3.0)
+        thread_B.join(timeout=3.0)
+
+        # Mandatory Assertions:
+        # 1. publish_item_local was called EXACTLY ONCE
+        assert call_count == 1, f"Expected call_count == 1, got {call_count}"
+
+        # 2. Both threads returned the exact same canonical result
+        assert results["A"] == canonical_result
+        assert results["B"] == canonical_result
+
+        # 3. Exactly 1 record persisted in the queue/ledger store for that key
+        saved_posts = load_scheduled_posts()
+        matching_posts = [p for p in saved_posts if p.get("idempotency_key") == "idem-concurrent-exact-key-999"]
+        assert len(matching_posts) == 1
+        assert matching_posts[0]["status"] == "published"
+        assert matching_posts[0]["result"] == canonical_result
+
+
+def test_recover_interrupted_posts_handles_immediate_processing(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from core.publisher import recover_interrupted_posts, load_scheduled_posts, save_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        posts = [
+            {"idempotency_key": "k1", "status": "immediate_processing"},
+            {"idempotency_key": "k2", "status": "processing"},
+            {"idempotency_key": "k3", "status": "published"},
+        ]
+        save_scheduled_posts(posts)
+
+        recovered = recover_interrupted_posts()
+        assert recovered == 2
+
+        posts_after = load_scheduled_posts()
+        assert posts_after[0]["status"] == "error"
+        assert posts_after[0]["error"] == "immediate_publish_interrupted_requires_reconciliation"
+        assert posts_after[1]["status"] == "error"
+        assert posts_after[1]["error"] == "worker_restarted_before_completion"
+        assert posts_after[2]["status"] == "published"
+
+
 @patch("core.publisher.load_scheduled_posts", return_value=[{"status": "pending"}, {"status": "done"}])
 def test_get_queue(mock_load):
     queue = get_queue()

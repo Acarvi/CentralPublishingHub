@@ -131,42 +131,106 @@ def get_queue():
     return [p for p in posts if p.get('status') == 'pending']
 
 
-def publish_now_with_idempotency(payload: dict[str, Any]) -> dict[str, Any]:
+def publish_now_with_idempotency(payload: dict[str, Any], wait_timeout_seconds: float = 60.0) -> dict[str, Any]:
     """
-    Executes immediate publishing with persistent idempotency.
-    If an operation with the same idempotency_key has already been executed,
-    it returns the persisted result without re-executing media uploads.
+    Executes immediate publishing with thread-safe persistent idempotency.
+    Protects against concurrent requests with the same idempotency_key:
+    - First request creates an 'immediate_processing' reservation under _QUEUE_LOCK and becomes owner.
+    - Owner releases _QUEUE_LOCK, executes publish_item_local(), and updates the record with the canonical result.
+    - Concurrent requests with the same key wait for the owner to finish and return the canonical result without re-executing.
     """
     idempotency_key = str(payload.get("idempotency_key") or "").strip()
     scheduled_id = str(payload.get("scheduled_id") or "").strip()
     client_job_id = str(payload.get("client_job_id") or "").strip()
 
+    is_owner = False
+
     if idempotency_key or scheduled_id or client_job_id:
-        with _QUEUE_LOCK:
-            posts = load_scheduled_posts()
-            existing = None
-            if idempotency_key:
-                for p in posts:
-                    if str(p.get("idempotency_key") or "").strip() == idempotency_key:
-                        existing = p
-                        break
-            if not existing and (scheduled_id or client_job_id):
-                for p in posts:
-                    if scheduled_id and str(p.get("scheduled_id") or "").strip() == scheduled_id:
-                        existing = p
-                        break
-                    if client_job_id and str(p.get("client_job_id") or "").strip() == client_job_id:
-                        existing = p
-                        break
+        while True:
+            with _QUEUE_LOCK:
+                posts = load_scheduled_posts()
+                existing = None
+                if idempotency_key:
+                    for p in posts:
+                        if str(p.get("idempotency_key") or "").strip() == idempotency_key:
+                            existing = p
+                            break
+                if not existing and (scheduled_id or client_job_id):
+                    for p in posts:
+                        if scheduled_id and str(p.get("scheduled_id") or "").strip() == scheduled_id:
+                            existing = p
+                            break
+                        if client_job_id and str(p.get("client_job_id") or "").strip() == client_job_id:
+                            existing = p
+                            break
 
-            if existing and existing.get("result") is not None:
-                # Idempotent replay: return canonical persisted execution result
-                return existing["result"]
+                if existing:
+                    if existing.get("result") is not None:
+                        # Idempotent replay: return canonical persisted execution result
+                        return existing["result"]
+                    if existing.get("status") == "immediate_processing":
+                        # Another thread/request is actively executing this operation
+                        pass
+                    else:
+                        return existing.get("result") or {"status": existing.get("status", "unknown")}
+                else:
+                    # Reserve operation under lock: this request becomes the exclusive owner
+                    reservation = dict(payload)
+                    reservation["status"] = "immediate_processing"
+                    reservation["started_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    if not reservation.get("scheduled_id"):
+                        reservation["scheduled_id"] = f"imm-{time.time_ns()}"
+                    posts.append(reservation)
+                    save_scheduled_posts(posts)
+                    is_owner = True
+                    break
 
-    # Execute publication
-    result = publish_item_local(payload)
+            if not is_owner:
+                # Bounded polling loop for concurrent request waiting on owner completion
+                deadline = time.time() + wait_timeout_seconds
+                while time.time() < deadline:
+                    time.sleep(0.05)
+                    with _QUEUE_LOCK:
+                        posts = load_scheduled_posts()
+                        existing = None
+                        if idempotency_key:
+                            for p in posts:
+                                if str(p.get("idempotency_key") or "").strip() == idempotency_key:
+                                    existing = p
+                                    break
+                        if not existing and (scheduled_id or client_job_id):
+                            for p in posts:
+                                if scheduled_id and str(p.get("scheduled_id") or "").strip() == scheduled_id:
+                                    existing = p
+                                    break
+                                if client_job_id and str(p.get("client_job_id") or "").strip() == client_job_id:
+                                    existing = p
+                                    break
+                        if existing and existing.get("result") is not None:
+                            return existing["result"]
+                        if not existing or existing.get("status") != "immediate_processing":
+                            break
 
-    # Persist execution result in ledger / queue store under lock
+                with _QUEUE_LOCK:
+                    posts = load_scheduled_posts()
+                    for p in posts:
+                        if idempotency_key and str(p.get("idempotency_key") or "").strip() == idempotency_key:
+                            if p.get("result") is not None:
+                                return p["result"]
+                            return {"status": p.get("status", "immediate_processing"), "message": "Operation in progress"}
+                return {"status": "immediate_processing", "message": "Operation in progress"}
+
+    # Owner execution: execute publication OUTSIDE lock
+    try:
+        result = publish_item_local(payload)
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "error": "immediate_publish_exception",
+            "details": str(exc),
+        }
+
+    # Persist final result under lock
     with _QUEUE_LOCK:
         posts = load_scheduled_posts()
         post_record = dict(payload)
@@ -208,27 +272,26 @@ def process_due_posts(now: datetime | None = None) -> int:
                         started = started.replace(tzinfo=timezone.utc)
                     if (now - started).total_seconds() > 20 * 60:
                         post['status'] = 'pending'
-                        post['retry_after'] = now.isoformat(timespec='seconds')
+                        post['started_at'] = None
                         changed = True
                 except ValueError:
                     post['status'] = 'pending'
+                    post['started_at'] = None
                     changed = True
                 continue
             if post.get('status') != 'pending':
                 continue
-            raw_time = str(post.get('target_time') or post.get('scheduled_at') or '').strip()
+            raw_target = post.get('target_time') or post.get('scheduled_at')
+            if not raw_target:
+                continue
             try:
-                target = datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+                target = datetime.fromisoformat(raw_target.replace('Z', '+00:00'))
                 if target.tzinfo is None:
                     target = target.replace(tzinfo=timezone.utc)
             except ValueError:
-                post['status'] = 'error'
-                post['error'] = 'invalid_target_time'
-                changed = True
                 continue
             if target > now:
                 continue
-            # A missed schedule must never be replayed hours later without review.
             if (now - target).total_seconds() > 15 * 60:
                 post['status'] = 'expired'
                 post['error'] = 'legacy_schedule_expired'
@@ -265,14 +328,20 @@ def process_due_posts(now: datetime | None = None) -> int:
     return len(due_indexes)
 
 def recover_interrupted_posts() -> int:
-    """Mark jobs left in processing by a previous process as actionable errors."""
+    """Mark jobs left in processing or immediate_processing by a previous process as actionable errors requiring reconciliation."""
     with _QUEUE_LOCK:
         posts = load_scheduled_posts()
         recovered = 0
         for post in posts:
-            if post.get("status") == "processing":
+            st = str(post.get("status") or "").strip()
+            if st == "processing":
                 post["status"] = "error"
                 post["error"] = "worker_restarted_before_completion"
+                post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                recovered += 1
+            elif st == "immediate_processing":
+                post["status"] = "error"
+                post["error"] = "immediate_publish_interrupted_requires_reconciliation"
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
         if recovered:
