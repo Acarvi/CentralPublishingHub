@@ -105,6 +105,104 @@ def test_add_to_queue_real_idempotency_avoids_duplicate_jobs(monkeypatch):
         assert queue_after_second[0]["scheduled_id"] == "sch-post-1"
 
 
+def test_publish_now_with_idempotency_replay_does_not_reexecute(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from core.publisher import publish_now_with_idempotency, load_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        call_count = 0
+        def mock_publish(payload):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "status": "success",
+                "results": [
+                    {"platform": "instagram_reel", "success": True, "result": {"id": "ig_1"}},
+                    {"platform": "youtube_shorts", "success": True, "result": {"id": "yt_1"}},
+                ],
+            }
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish)
+
+        payload_1 = {
+            "caption": "Immediate Post",
+            "idempotency_key": "idem-imm-123",
+            "scheduled_id": "sch-imm-1",
+            "client_job_id": "attempt-imm-1",
+            "platforms": ["instagram_reel", "youtube_shorts"],
+        }
+
+        # First call executes publication
+        res1 = publish_now_with_idempotency(payload_1)
+        assert res1["status"] == "success"
+        assert call_count == 1
+
+        # Second call (transport replay with same idempotency key)
+        payload_1_replay = dict(
+            payload_1,
+            client_job_id="attempt-imm-1-retry",
+            scheduled_id="sch-imm-1-retry",
+        )
+        res2 = publish_now_with_idempotency(payload_1_replay)
+        assert res2["status"] == "success"
+        # publish_item_local MUST NOT be called again! (Deduplicated!)
+        assert call_count == 1
+        assert res2 == res1
+
+
+def test_publish_now_with_idempotency_new_operation_after_failure_executes(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from core.publisher import publish_now_with_idempotency
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        call_count = 0
+        def mock_publish(payload):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {
+                    "status": "error",
+                    "results": [{"platform": "youtube_shorts", "success": False, "result": {"error": "Quota"}}],
+                }
+            return {
+                "status": "success",
+                "results": [{"platform": "youtube_shorts", "success": True, "result": {"id": "yt_ok"}}],
+            }
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish)
+
+        payload_A = {
+            "caption": "Post A",
+            "idempotency_key": "idem-op-A",
+            "scheduled_id": "sch-A",
+            "client_job_id": "attempt-A",
+            "platforms": ["youtube_shorts"],
+        }
+        res_A = publish_now_with_idempotency(payload_A)
+        assert res_A["status"] == "error"
+        assert call_count == 1
+
+        # Retry creates new operation B with new idempotency key
+        payload_B = {
+            "caption": "Post A",
+            "idempotency_key": "idem-op-B",
+            "scheduled_id": "sch-B",
+            "client_job_id": "attempt-B",
+            "platforms": ["youtube_shorts"],
+        }
+        res_B = publish_now_with_idempotency(payload_B)
+        assert res_B["status"] == "success"
+        assert call_count == 2
+
+
 @patch("core.publisher.load_scheduled_posts", return_value=[{"status": "pending"}, {"status": "done"}])
 def test_get_queue(mock_load):
     queue = get_queue()

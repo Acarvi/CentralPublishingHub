@@ -121,13 +121,70 @@ def add_to_queue(new_posts: list) -> list[dict[str, Any]]:
                 resolved_posts.append(p)
                 changed = True
 
-        if changed:
-            save_scheduled_posts(posts)
-        return resolved_posts
-
 def get_queue():
     posts = load_scheduled_posts()
     return [p for p in posts if p.get('status') == 'pending']
+
+
+def publish_now_with_idempotency(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Executes immediate publishing with persistent idempotency.
+    If an operation with the same idempotency_key has already been executed,
+    it returns the persisted result without re-executing media uploads.
+    """
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()
+    scheduled_id = str(payload.get("scheduled_id") or "").strip()
+    client_job_id = str(payload.get("client_job_id") or "").strip()
+
+    if idempotency_key or scheduled_id or client_job_id:
+        with _QUEUE_LOCK:
+            posts = load_scheduled_posts()
+            existing = None
+            if idempotency_key:
+                for p in posts:
+                    if str(p.get("idempotency_key") or "").strip() == idempotency_key:
+                        existing = p
+                        break
+            if not existing and (scheduled_id or client_job_id):
+                for p in posts:
+                    if scheduled_id and str(p.get("scheduled_id") or "").strip() == scheduled_id:
+                        existing = p
+                        break
+                    if client_job_id and str(p.get("client_job_id") or "").strip() == client_job_id:
+                        existing = p
+                        break
+
+            if existing and existing.get("result") is not None:
+                # Idempotent replay: return canonical persisted execution result
+                return existing["result"]
+
+    # Execute publication
+    result = publish_item_local(payload)
+
+    # Persist execution result in ledger / queue store under lock
+    with _QUEUE_LOCK:
+        posts = load_scheduled_posts()
+        post_record = dict(payload)
+        post_record["status"] = "published" if result.get("status") == "success" else "error"
+        post_record["result"] = result
+        post_record["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if not post_record.get("scheduled_id"):
+            post_record["scheduled_id"] = f"imm-{time.time_ns()}"
+
+        idx = None
+        if idempotency_key:
+            for i, p in enumerate(posts):
+                if str(p.get("idempotency_key") or "").strip() == idempotency_key:
+                    idx = i
+                    break
+        if idx is not None:
+            posts[idx] = post_record
+        else:
+            posts.append(post_record)
+
+        save_scheduled_posts(posts)
+
+    return result
 
 
 def process_due_posts(now: datetime | None = None) -> int:

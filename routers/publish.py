@@ -84,11 +84,11 @@ def schedule_batch(payload: SchedulePayload, background_tasks: BackgroundTasks):
 @router.post("/publish-now")
 async def publish_now_api(payload: PostPayload):
     """
-    Endpoint to publish an item immediately across platforms.
+    Endpoint to publish an item immediately across platforms with persistent idempotency.
     """
     try:
-        # Call the publisher's local publish function
-        result = publisher.publish_item_local(payload.model_dump())
+        # Call the publisher with persistent idempotency to deduplicate replays
+        result = publisher.publish_now_with_idempotency(payload.model_dump())
         return {"status": "success", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
