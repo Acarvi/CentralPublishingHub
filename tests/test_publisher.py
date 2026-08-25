@@ -11,6 +11,7 @@ from core.publisher import (
     resolve_public_media_url, normalize_platforms, process_due_posts
 )
 
+
 @patch("os.path.exists", return_value=False)
 def test_load_accounts_missing(mock_exists):
     accounts = load_accounts()
@@ -40,11 +41,13 @@ def test_load_scheduled_posts(mock_exists, mock_file):
     posts = load_scheduled_posts()
     assert posts == []
 
+@patch("os.replace")
 @patch("builtins.open", new_callable=mock_open)
 @patch("json.dump")
-def test_save_scheduled_posts(mock_json, mock_file):
+def test_save_scheduled_posts(mock_json, mock_file, mock_replace):
     save_scheduled_posts([{"id": 1}])
     mock_json.assert_called_once()
+    mock_replace.assert_called_once()
 
 @patch("core.publisher.load_scheduled_posts", return_value=[])
 @patch("core.publisher.save_scheduled_posts")
@@ -412,40 +415,46 @@ def test_is_platform_success_contract():
     assert is_platform_success(["id", "123"]) is False
 
 
-def test_save_scheduled_posts_atomic_replace_success(tmp_path, monkeypatch):
+def test_save_scheduled_posts_atomic_replace_success(monkeypatch):
+    import tempfile
+    from pathlib import Path
     from core.publisher import save_scheduled_posts, load_scheduled_posts
-    target_file = tmp_path / "scheduled_posts.json"
-    monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
 
-    initial_posts = [{"scheduled_id": "job-1", "status": "pending"}]
-    save_scheduled_posts(initial_posts)
+        initial_posts = [{"scheduled_id": "job-1", "status": "pending"}]
+        save_scheduled_posts(initial_posts)
 
-    assert target_file.exists()
-    assert load_scheduled_posts() == initial_posts
-    assert not (tmp_path / "scheduled_posts.json.tmp").exists()
+        assert target_file.exists()
+        assert load_scheduled_posts() == initial_posts
+        assert not (Path(td) / "scheduled_posts.json.tmp").exists()
 
 
-def test_save_scheduled_posts_replace_failure_preserves_original(tmp_path, monkeypatch):
+def test_save_scheduled_posts_replace_failure_preserves_original(monkeypatch):
     import os
+    import tempfile
+    from pathlib import Path
     import pytest
     from core.publisher import save_scheduled_posts, load_scheduled_posts
-    target_file = tmp_path / "scheduled_posts.json"
-    monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
 
-    # Initial valid queue
-    original_posts = [{"scheduled_id": "job-original", "status": "pending"}]
-    save_scheduled_posts(original_posts)
+        # Initial valid queue
+        original_posts = [{"scheduled_id": "job-original", "status": "pending"}]
+        save_scheduled_posts(original_posts)
 
-    # Force os.replace to fail (e.g. permission or lock error)
-    def mock_replace_fail(src, dst):
-        raise PermissionError("Simulated file lock")
+        # Force os.replace to fail (e.g. permission or lock error)
+        def mock_replace_fail(src, dst):
+            raise PermissionError("Simulated file lock")
 
-    monkeypatch.setattr(os, "replace", mock_replace_fail)
-    monkeypatch.setattr("time.sleep", lambda s: None)
+        monkeypatch.setattr(os, "replace", mock_replace_fail)
+        monkeypatch.setattr("time.sleep", lambda s: None)
 
-    with pytest.raises(PermissionError):
-        save_scheduled_posts([{"scheduled_id": "job-corrupted", "status": "pending"}])
+        with pytest.raises(PermissionError):
+            save_scheduled_posts([{"scheduled_id": "job-corrupted", "status": "pending"}])
 
-    # Ensure original queue remains pristine
-    assert load_scheduled_posts() == original_posts
+        # Ensure original queue remains pristine
+        assert load_scheduled_posts() == original_posts
 
