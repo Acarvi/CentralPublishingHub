@@ -328,7 +328,7 @@ def process_due_posts(now: datetime | None = None) -> int:
     return len(due_indexes)
 
 def recover_interrupted_posts() -> int:
-    """Mark jobs left in processing or immediate_processing by a previous process as actionable errors requiring reconciliation."""
+    """Mark jobs left in processing or immediate_processing by a previous process as actionable errors or unknown states requiring reconciliation."""
     with _QUEUE_LOCK:
         posts = load_scheduled_posts()
         recovered = 0
@@ -340,8 +340,13 @@ def recover_interrupted_posts() -> int:
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
             elif st == "immediate_processing":
-                post["status"] = "error"
+                post["status"] = "unknown"
                 post["error"] = "immediate_publish_interrupted_requires_reconciliation"
+                post["result"] = {
+                    "status": "unknown",
+                    "error": "immediate_publish_interrupted_requires_reconciliation",
+                    "requires_reconciliation": True,
+                }
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
         if recovered:

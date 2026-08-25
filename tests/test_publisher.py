@@ -319,11 +319,77 @@ def test_recover_interrupted_posts_handles_immediate_processing(monkeypatch):
         assert recovered == 2
 
         posts_after = load_scheduled_posts()
-        assert posts_after[0]["status"] == "error"
+        # immediate_processing MUST become unknown, NOT error
+        assert posts_after[0]["status"] == "unknown"
         assert posts_after[0]["error"] == "immediate_publish_interrupted_requires_reconciliation"
+        assert posts_after[0]["result"]["requires_reconciliation"] is True
         assert posts_after[1]["status"] == "error"
         assert posts_after[1]["error"] == "worker_restarted_before_completion"
         assert posts_after[2]["status"] == "published"
+
+
+def test_recover_interrupted_posts_preserves_unknown_and_replay_does_not_execute(monkeypatch):
+    """
+    Crash test:
+    reservation immediate_processing -> recover_interrupted_posts -> replay same operation
+    Verify:
+    1. publish_item_local.call_count == 0 on replay
+    2. Same idempotency key
+    3. No new operation
+    4. Result unknown / requires_reconciliation
+    """
+    import tempfile
+    from pathlib import Path
+    from core.publisher import recover_interrupted_posts, publish_now_with_idempotency, load_scheduled_posts, save_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        # 1. Post is in immediate_processing when crash happens
+        posts = [
+            {
+                "idempotency_key": "idem-crash-test-1",
+                "scheduled_id": "sch-crash-1",
+                "client_job_id": "attempt-crash-1",
+                "status": "immediate_processing",
+                "caption": "Crash test post",
+                "platforms": ["instagram_reel"],
+            }
+        ]
+        save_scheduled_posts(posts)
+
+        # 2. Hub recovers after crash
+        recovered = recover_interrupted_posts()
+        assert recovered == 1
+
+        posts_after_restart = load_scheduled_posts()
+        # Status MUST be unknown (NOT error / failed)
+        assert posts_after_restart[0]["status"] == "unknown"
+        assert posts_after_restart[0]["error"] == "immediate_publish_interrupted_requires_reconciliation"
+
+        # 3. Client replays the same operation after network reconnection
+        call_count = 0
+        def mock_publish(payload):
+            nonlocal call_count
+            call_count += 1
+            return {"status": "success", "results": []}
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish)
+
+        replay_payload = {
+            "idempotency_key": "idem-crash-test-1",
+            "scheduled_id": "sch-crash-1",
+            "client_job_id": "attempt-crash-1",
+            "caption": "Crash test post",
+            "platforms": ["instagram_reel"],
+        }
+        res = publish_now_with_idempotency(replay_payload)
+
+        # Replay MUST NOT call publish_item_local()!
+        assert call_count == 0
+        assert res["status"] == "unknown"
+        assert res.get("requires_reconciliation") is True
 
 
 @patch("core.publisher.load_scheduled_posts", return_value=[{"status": "pending"}, {"status": "done"}])
