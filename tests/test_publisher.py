@@ -2,12 +2,13 @@ import pytest
 import os
 import json
 import requests
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock, mock_open
 from core.publisher import (
     load_accounts, get_account_credentials, load_scheduled_posts,
     save_scheduled_posts, add_to_queue, get_queue, upload_to_temporary_host,
     publish_item_local, search_locations, requires_public_url,
-    resolve_public_media_url, normalize_platforms
+    resolve_public_media_url, normalize_platforms, process_due_posts
 )
 
 @patch("os.path.exists", return_value=False)
@@ -58,6 +59,25 @@ def test_get_queue(mock_load):
     queue = get_queue()
     assert len(queue) == 1
     assert queue[0]["status"] == "pending"
+
+
+@patch("core.publisher.publish_item_local", return_value={"status": "success", "results": []})
+@patch("core.publisher.save_scheduled_posts")
+@patch("core.publisher.load_scheduled_posts")
+def test_process_due_posts_publishes_current_and_expires_legacy(mock_load, mock_save, mock_publish):
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    posts = [
+        {"status": "pending", "target_time": (now - timedelta(minutes=1)).isoformat()},
+        {"status": "pending", "target_time": (now - timedelta(days=2)).isoformat()},
+        {"status": "pending", "target_time": (now + timedelta(hours=1)).isoformat()},
+    ]
+    mock_load.side_effect = lambda: posts
+
+    assert process_due_posts(now) == 1
+    mock_publish.assert_called_once()
+    assert posts[0]["status"] == "published"
+    assert posts[1]["status"] == "expired"
+    assert posts[2]["status"] == "pending"
 
 def test_requires_public_url_for_instagram_targets():
     assert requires_public_url(["instagram_reel"]) is True
@@ -125,37 +145,50 @@ def test_resolve_public_media_url_does_not_upload_for_youtube(mock_upload):
 
 @patch("requests.get")
 @patch("requests.post")
-def test_upload_to_temporary_host_gofile(mock_post, mock_get):
-    # Mock Gofile success
-    mock_get.return_value.json.return_value = {"status": "ok", "data": {"servers": [{"name": "srv1"}]}}
+def test_upload_to_temporary_host_catbox(mock_post, mock_get):
     mock_post.return_value.status_code = 200
-    mock_post.return_value.json.return_value = {"status": "ok", "data": {"downloadPage": "http://gofile.io/123"}}
+    mock_post.return_value.text = "https://files.catbox.moe/test.mp4"
     
     with patch("builtins.open", mock_open(read_data=b"data")):
         url = upload_to_temporary_host("test.mp4")
-        assert url == "http://gofile.io/123"
+        assert url == "https://files.catbox.moe/test.mp4"
+    mock_get.assert_not_called()
 
 @patch("requests.get", side_effect=Exception("Fail"))
 @patch("requests.post")
-def test_upload_to_temporary_host_uguu(mock_post, mock_get):
-    # Gofile fails, try Uguu
-    mock_post.return_value.status_code = 200
-    mock_post.return_value.text = "https://uguu.se/test.mp4"
+@patch("time.sleep")
+def test_upload_to_temporary_host_uguu(mock_sleep, mock_post, mock_get):
+    mock_post.side_effect = [
+        Exception("Catbox fail 1"),
+        Exception("Catbox fail 2"),
+        Exception("Catbox fail 3"),
+        Exception("Litterbox fail"),
+        MagicMock(status_code=200, text="https://uguu.se/test.mp4"),
+    ]
     
     with patch("builtins.open", mock_open(read_data=b"data")):
         url = upload_to_temporary_host("test.mp4")
         assert url == "https://uguu.se/test.mp4"
 
-@patch("requests.get", side_effect=Exception("Fail"))
+@patch("requests.get")
 @patch("requests.post")
-def test_upload_to_temporary_host_catbox(mock_post, mock_get):
-    # Gofile and Uguu fail, try Catbox
-    # First post (Uguu) fails
-    mock_post.side_effect = [Exception("Uguu fail"), MagicMock(status_code=200, text="https://files.catbox.moe/test.mp4")]
+@patch("time.sleep")
+def test_upload_to_temporary_host_gofile_last(mock_sleep, mock_post, mock_get):
+    mock_get.return_value.json.return_value = {"status": "ok", "data": {"servers": [{"name": "srv1"}]}}
+    gofile_response = MagicMock(status_code=200)
+    gofile_response.json.return_value = {"status": "ok", "data": {"downloadPage": "http://gofile.io/123"}}
+    mock_post.side_effect = [
+        Exception("Catbox fail 1"),
+        Exception("Catbox fail 2"),
+        Exception("Catbox fail 3"),
+        Exception("Litterbox fail"),
+        Exception("Uguu fail"),
+        gofile_response,
+    ]
     
     with patch("builtins.open", mock_open(read_data=b"data")):
         url = upload_to_temporary_host("test.mp4")
-        assert url == "https://files.catbox.moe/test.mp4"
+        assert url == "http://gofile.io/123"
 
 @patch("core.publisher.get_account_credentials", return_value={"access_token": "tk", "ig_user_id": "ig", "fb_page_id": "fb"})
 @patch("requests.post")
@@ -193,7 +226,76 @@ def test_upload_to_ig_exception(mock_post):
     mock_post.side_effect = Exception("API ERR")
     with patch("time.sleep"):
         res = _upload_to_ig("http://url", "cap", "tk", "ig", "REELS")
-        assert res is None
+        assert res["error"] == "IG_REQUEST_FAILED"
+
+@patch("core.publisher.get_account_credentials", return_value={"access_token": "tk", "ig_user_id": "ig", "fb_page_id": "fb"})
+@patch("requests.post")
+@patch("core.publisher.upload_to_temporary_host", return_value="http://url")
+@patch("time.sleep")
+@patch("core.publisher.upload_short")
+@patch("core.publisher.upload_facebook_video")
+def test_publish_item_local_all_platforms(mock_fb, mock_yt, mock_sleep, mock_upload, mock_post, mock_get_creds):
+    post = {
+        "caption": "test",
+        "platforms": ["instagram_reel", "instagram_story", "facebook_reel", "facebook_story", "youtube_shorts"],
+        "video_path": "path/to/vid.mp4"
+    }
+    # Mock IG upload sequence
+    mock_post.return_value.json.side_effect = [
+        {"id": "c1"}, {"status_code": "FINISHED"}, {"id": "p1"}, # Reel
+        {"id": "c2"}, {"status_code": "FINISHED"}, {"id": "p2"}  # Story
+    ]
+    publish_item_local(post)
+    assert mock_yt.called
+    assert mock_fb.call_count == 2
+
+@patch("requests.post")
+def test_upload_facebook_video_pull(mock_post):
+    from core.publisher import upload_facebook_video
+    with patch("core.publisher.get_page_access_token", return_value="p_tk"):
+        with patch("os.path.exists", return_value=False): # Force pull phase
+            mock_post.return_value.json.side_effect = [
+                {"video_id": "vid123", "upload_url": "http://up"},
+                {"success": True}
+            ]
+            mock_post.return_value.status_code = 200
+            res = upload_facebook_video("http://external/vid.mp4", "cap", "u_tk", "p_id")
+            assert res["id"] == "vid123"
+
+@patch("requests.post")
+def test_upload_facebook_video_exception(mock_post):
+    from core.publisher import upload_facebook_video
+    with patch("core.publisher.get_page_access_token", return_value="tk"):
+        mock_post.side_effect = Exception("General Err")
+        res = upload_facebook_video("url", "cap", "tk", "id")
+        assert res["error"] == "General Err"
+
+@patch("core.publisher.get_account_credentials", return_value=None)
+@patch("core.publisher.get_env_or_raise", return_value="env_tk")
+@patch("requests.post")
+def test_publish_item_local_env_fallback(mock_post, mock_env, mock_get_creds):
+    post = {"platforms": ["instagram_reel"], "video_url": "http://url", "caption": "test"}
+    mock_post.return_value.json.side_effect = [{"id": "c"}, {"status_code": "FINISHED"}, {"id": "p"}]
+    with patch("time.sleep"):
+        publish_item_local(post)
+    assert mock_env.called
+
+@patch("requests.get", side_effect=lambda x: MagicMock(json=lambda: {"status": "ok", "data": {"servers": [{"name": "s"}]}}) if "servers" in x else Exception("Upload failed"))
+@patch("requests.post", side_effect=Exception("Post failed"))
+def test_upload_to_temporary_host_retry_logic(mock_post, mock_get):
+    # This will trigger the Uguu and Catbox fallbacks
+    with patch("builtins.open", mock_open(read_data=b"data")):
+        with patch("time.sleep"):
+            url = upload_to_temporary_host("test.mp4")
+            assert url is None # All fail but lines are covered
+
+def test_get_page_access_token():
+    from core.publisher import get_page_access_token
+    with patch("requests.get") as mock_get:
+        mock_get.return_value.json.return_value = {"access_token": "page_tk"}
+        assert get_page_access_token("u_tk", "p_id") == "page_tk"
+        
+        mock_get.side_effect = Exception("Err")
 
 @patch("core.publisher.get_account_credentials", return_value={"access_token": "tk", "ig_user_id": "ig", "fb_page_id": "fb"})
 @patch("requests.post")
@@ -285,3 +387,26 @@ def test_upload_facebook_video_local(mock_post):
 def test_search_locations_error(mock_get, mock_creds):
     results = search_locations("Madrid")
     assert results == []
+
+def test_is_platform_success_contract():
+    from core.publisher import is_platform_success
+
+    # Real success cases
+    assert is_platform_success({"id": "178923456789"}) is True
+    assert is_platform_success({"video_id": "v12345"}) is True
+    assert is_platform_success({"id": "ig_123", "permalink": "https://ig/p/123"}) is True
+    assert is_platform_success({"success": True}) is True
+
+    # Error cases that must NEVER be treated as success
+    assert is_platform_success({"error": "LIVE_MODE_RESTRICTION"}) is False
+    assert is_platform_success({"error": "IG_CONTAINER_CREATE_FAILED", "message": "Failed"}) is False
+    assert is_platform_success({"error_message": "Invalid OAuth access token"}) is False
+    assert is_platform_success({"errors": [{"code": 100, "message": "Rate limit"}]}) is False
+    assert is_platform_success({"error": "Page Access Token Missing"}) is False
+    assert is_platform_success({"status_code": 400, "detail": "Bad request"}) is False
+    assert is_platform_success({"status_code": 500, "id": "fake_id"}) is False
+    assert is_platform_success({"success": False, "details": "Something failed"}) is False
+    assert is_platform_success(None) is False
+    assert is_platform_success({}) is False
+    assert is_platform_success("truthy string") is False
+    assert is_platform_success(["id", "123"]) is False

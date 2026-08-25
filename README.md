@@ -32,6 +32,12 @@ See [docs/meta-instagram-hosting.md](docs/meta-instagram-hosting.md) for the for
    ```
    (El servidor arrancará en el puerto 8000).
 
+## Always-on scheduling
+
+`render.yaml` and `Dockerfile` define an always-on deployment with a persistent disk. Configure `META_ACCESS_TOKEN`, `IG_USER_ID`, `FB_PAGE_ID`, `YOUTUBE_TOKEN_JSON`, and `HUB_API_KEY` in the hosting service. Each desktop client must use that same Hub key as `ECONOMIKA_ADMIN_API_KEY`.
+
+Set `CENTRAL_PUBLISHING_HUB_URL` in EconomikaNoticias to the deployed HTTPS URL. For scheduled posts, the desktop client uploads the finished reel before queueing it, so the Hub does not depend on a local Windows path or on the GUI remaining open.
+
 ## API Endpoints
 ...
 This project follows the **Skills Architecture** protocol (.agent/skills/).

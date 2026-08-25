@@ -4,7 +4,12 @@ import sys
 import json
 import pickle
 from unittest.mock import patch, MagicMock, mock_open
-from core.youtube_uploader import get_authenticated_service, upload_short
+from core.youtube_uploader import channel_matches_expected, get_authenticated_service, upload_short
+
+
+def test_expected_channel_name_accepts_brand_accent():
+    assert channel_matches_expected({"title": "Económika Noticias"}) is True
+    assert channel_matches_expected({"title": "Economika"}) is False
 
 # SentinelAPI fallback for CI environments
 try:
@@ -51,8 +56,9 @@ def test_get_authenticated_service_new_token(mock_pickle, mock_exists, mock_flow
     assert mock_flow.called
 
 @patch("core.youtube_uploader.get_authenticated_service")
+@patch("core.youtube_uploader.get_authenticated_channel", return_value={"id": "channel1", "title": "Economika Noticias"})
 @patch("core.youtube_uploader.MediaFileUpload")
-def test_upload_short(mock_media, mock_get_auth):
+def test_upload_short(mock_media, mock_channel, mock_get_auth):
     mock_service = MagicMock()
     mock_get_auth.return_value = mock_service
     
@@ -62,8 +68,9 @@ def test_upload_short(mock_media, mock_get_auth):
     mock_service.videos.return_value.insert.return_value = mock_request
     
     with patch("os.path.exists", return_value=True):
-        upload_short("vid.mp4", "Title", "Desc")
+        result = upload_short("vid.mp4", "Title", "Desc")
         mock_service.videos.return_value.insert.assert_called()
+        assert result["channel_title"] == "Economika Noticias"
 
 @patch("core.youtube_uploader.build")
 @patch("google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file")
@@ -96,13 +103,10 @@ def test_upload_short_quota_error(mock_http_error_class):
         mock_request.next_chunk.side_effect = Exception("quotaExceeded")
         mock_service.videos.return_value.insert.return_value = mock_request
         
-        with patch("os.path.exists", return_value=True):
-            result = upload_short("vid.mp4", "Title", "Desc")
-            # The uploader checks 'in error_msg'. If str(e) is 'quotaExceeded', it should match.
-            # In some envs str(e) might be "Exception: quotaExceeded"
-            assert result["error"] in ["quota_limit", "failed"] 
-            # If it returns 'failed', it means the string match failed. 
-            # Let's be aggressive and fix the uploader logic too.
+        with patch("core.youtube_uploader.get_authenticated_channel", return_value={"id": "channel1", "title": "Economika Noticias"}):
+            with patch("os.path.exists", return_value=True):
+                result = upload_short("vid.mp4", "Title", "Desc")
+                assert result["error"] in ["quota_limit", "failed"]
 
 def test_sentinel_lock_simulation():
     """Verify that if Sentinel security audit fails, the service should theoretically block."""
