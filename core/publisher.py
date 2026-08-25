@@ -121,6 +121,11 @@ def add_to_queue(new_posts: list) -> list[dict[str, Any]]:
                 resolved_posts.append(p)
                 changed = True
 
+        if changed:
+            save_scheduled_posts(posts)
+        return resolved_posts
+
+
 def get_queue():
     posts = load_scheduled_posts()
     return [p for p in posts if p.get('status') == 'pending']
