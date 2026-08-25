@@ -77,15 +77,53 @@ def save_scheduled_posts(posts):
         raise last_error
     raise RuntimeError("Failed to save scheduled posts atomically")
 
-def add_to_queue(new_posts: list):
+def add_to_queue(new_posts: list) -> list[dict[str, Any]]:
+    """
+    Adds posts to the scheduled queue with atomic persistence and real idempotency.
+    If a post with the same idempotency_key (or scheduled_id) already exists,
+    it reuses the persisted post instead of creating a duplicate.
+    """
     with _QUEUE_LOCK:
         posts = load_scheduled_posts()
+        resolved_posts = []
+        changed = False
         for p in new_posts:
-            p['status'] = 'pending'
-            p['scheduled_id'] = p.get('scheduled_id') or f"scheduled-{time.time_ns()}"
-            p['queued_at'] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        posts.extend(new_posts)
-        save_scheduled_posts(posts)
+            idempotency_key = str(p.get("idempotency_key") or "").strip()
+            scheduled_id = str(p.get("scheduled_id") or "").strip()
+            client_job_id = str(p.get("client_job_id") or "").strip()
+
+            # Check for existing job by idempotency_key
+            existing = None
+            if idempotency_key:
+                for ep in posts:
+                    if str(ep.get("idempotency_key") or "").strip() == idempotency_key:
+                        existing = ep
+                        break
+
+            # Secondary fallback: match by exact scheduled_id or client_job_id
+            if not existing and (scheduled_id or client_job_id):
+                for ep in posts:
+                    if scheduled_id and str(ep.get("scheduled_id") or "").strip() == scheduled_id:
+                        existing = ep
+                        break
+                    if client_job_id and str(ep.get("client_job_id") or "").strip() == client_job_id:
+                        existing = ep
+                        break
+
+            if existing:
+                # Idempotent replay: reuse the canonical persisted job
+                resolved_posts.append(existing)
+            else:
+                p["status"] = p.get("status") or "pending"
+                p["scheduled_id"] = p.get("scheduled_id") or f"scheduled-{time.time_ns()}"
+                p["queued_at"] = p.get("queued_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")
+                posts.append(p)
+                resolved_posts.append(p)
+                changed = True
+
+        if changed:
+            save_scheduled_posts(posts)
+        return resolved_posts
 
 def get_queue():
     posts = load_scheduled_posts()

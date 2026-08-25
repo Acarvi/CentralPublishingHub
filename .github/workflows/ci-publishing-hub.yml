@@ -22,9 +22,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest pytest-asyncio httpx requests
+          python -m pip check
 
       - name: Run Tests
         env:
           PYTHONPATH: .
         run: |
-          pytest tests/test_youtube.py tests/test_publisher.py
+          python -m pytest

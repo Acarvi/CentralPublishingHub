@@ -52,10 +52,58 @@ def test_save_scheduled_posts(mock_json, mock_file, mock_replace):
 @patch("core.publisher.load_scheduled_posts", return_value=[])
 @patch("core.publisher.save_scheduled_posts")
 def test_add_to_queue(mock_save, mock_load):
-    add_to_queue([{"cap": "test"}])
+    res = add_to_queue([{"cap": "test"}])
     mock_save.assert_called_once()
     saved_posts = mock_save.call_args[0][0]
     assert saved_posts[0]["status"] == "pending"
+    assert len(res) == 1
+
+
+def test_add_to_queue_real_idempotency_avoids_duplicate_jobs(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from core.publisher import add_to_queue, load_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        # First request
+        first_post = {
+            "caption": "Noticia A",
+            "idempotency_key": "idem-key-abc-123",
+            "scheduled_id": "sch-post-1",
+            "client_job_id": "attempt-1",
+            "platforms": ["instagram_reel"],
+        }
+        res1 = add_to_queue([first_post])
+        assert len(res1) == 1
+        assert res1[0]["scheduled_id"] == "sch-post-1"
+        assert res1[0]["client_job_id"] == "attempt-1"
+
+        queue_after_first = load_scheduled_posts()
+        assert len(queue_after_first) == 1
+
+        # Second request (retransmission of same logical operation with different attempt ID)
+        second_post = {
+            "caption": "Noticia A",
+            "idempotency_key": "idem-key-abc-123",
+            "scheduled_id": "sch-post-2-retry",
+            "client_job_id": "attempt-2-retry",
+            "platforms": ["instagram_reel"],
+        }
+        res2 = add_to_queue([second_post])
+        assert len(res2) == 1
+        # Reuses canonical job persisted in queue
+        assert res2[0]["scheduled_id"] == "sch-post-1"
+        assert res2[0]["client_job_id"] == "attempt-1"
+        assert res2[0]["idempotency_key"] == "idem-key-abc-123"
+
+        # Queue MUST still contain exactly 1 job (no duplicate!)
+        queue_after_second = load_scheduled_posts()
+        assert len(queue_after_second) == 1
+        assert queue_after_second[0]["scheduled_id"] == "sch-post-1"
+
 
 @patch("core.publisher.load_scheduled_posts", return_value=[{"status": "pending"}, {"status": "done"}])
 def test_get_queue(mock_load):

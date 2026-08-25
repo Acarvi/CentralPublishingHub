@@ -59,8 +59,8 @@ def schedule_batch(payload: SchedulePayload, background_tasks: BackgroundTasks):
     # For a robust system, this should write to a DB or a Queue (Redis, etc.)
     # For now, we will add them to the local scheduled JSON or memory        # Call the publisher to queue the items
     try:
-        scheduled = [p.model_dump() for p in payload.posts]
-        publisher.add_to_queue(scheduled)
+        raw_posts = [p.model_dump() for p in payload.posts]
+        scheduled = publisher.add_to_queue(raw_posts)
         return {
             "status": "success",
             "schedule_status": "scheduled",
