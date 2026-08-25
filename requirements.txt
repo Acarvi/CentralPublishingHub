@@ -1,8 +1,9 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-requests==2.31.0
-python-dotenv==1.0.0
-google-api-python-client==2.108.0
-google-auth-oauthlib==1.1.0
-google-auth-httplib2==0.1.1
-opencv-python-headless==4.8.1.78
+fastapi>=0.110.0,<0.116.0
+uvicorn>=0.24.0,<0.35.0
+requests>=2.31.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+python-multipart>=0.0.9,<0.0.21
+google-api-python-client>=2.108.0,<3.0.0
+google-auth-oauthlib>=1.1.0,<2.0.0
+google-auth-httplib2>=0.1.1,<1.0.0
+opencv-python-headless>=4.8.1.78,<5.0.0.0
