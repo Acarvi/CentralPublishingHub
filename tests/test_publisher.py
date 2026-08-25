@@ -410,3 +410,42 @@ def test_is_platform_success_contract():
     assert is_platform_success({}) is False
     assert is_platform_success("truthy string") is False
     assert is_platform_success(["id", "123"]) is False
+
+
+def test_save_scheduled_posts_atomic_replace_success(tmp_path, monkeypatch):
+    from core.publisher import save_scheduled_posts, load_scheduled_posts
+    target_file = tmp_path / "scheduled_posts.json"
+    monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+    initial_posts = [{"scheduled_id": "job-1", "status": "pending"}]
+    save_scheduled_posts(initial_posts)
+
+    assert target_file.exists()
+    assert load_scheduled_posts() == initial_posts
+    assert not (tmp_path / "scheduled_posts.json.tmp").exists()
+
+
+def test_save_scheduled_posts_replace_failure_preserves_original(tmp_path, monkeypatch):
+    import os
+    import pytest
+    from core.publisher import save_scheduled_posts, load_scheduled_posts
+    target_file = tmp_path / "scheduled_posts.json"
+    monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+    # Initial valid queue
+    original_posts = [{"scheduled_id": "job-original", "status": "pending"}]
+    save_scheduled_posts(original_posts)
+
+    # Force os.replace to fail (e.g. permission or lock error)
+    def mock_replace_fail(src, dst):
+        raise PermissionError("Simulated file lock")
+
+    monkeypatch.setattr(os, "replace", mock_replace_fail)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    with pytest.raises(PermissionError):
+        save_scheduled_posts([{"scheduled_id": "job-corrupted", "status": "pending"}])
+
+    # Ensure original queue remains pristine
+    assert load_scheduled_posts() == original_posts
+

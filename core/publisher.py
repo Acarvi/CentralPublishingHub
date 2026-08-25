@@ -50,8 +50,10 @@ def load_scheduled_posts():
 
 def save_scheduled_posts(posts):
     # Google Drive and antivirus scanners can briefly hold the JSON file.
-    # Write a complete sibling file first, then replace the queue atomically
-    # so the worker never leaves a truncated or locked queue behind.
+    # Write a complete sibling file first, flush and fsync, close it completely,
+    # then replace the queue atomically so the worker never leaves a truncated
+    # or locked queue behind.
+    os.makedirs(os.path.dirname(SCHEDULED_POSTS_FILE), exist_ok=True)
     temp_path = f"{SCHEDULED_POSTS_FILE}.tmp"
     last_error = None
     for attempt in range(5):
@@ -65,16 +67,15 @@ def save_scheduled_posts(posts):
                         os.fsync(fd)
                 except (AttributeError, OSError, TypeError):
                     pass
-                try:
-                    os.replace(temp_path, SCHEDULED_POSTS_FILE)
-                except FileNotFoundError:
-                    pass
-                return
-        except PermissionError as exc:
+            # File is completely closed before atomic replace
+            os.replace(temp_path, SCHEDULED_POSTS_FILE)
+            return
+        except (PermissionError, OSError) as exc:
             last_error = exc
             time.sleep(0.5 * (attempt + 1))
     if last_error:
         raise last_error
+    raise RuntimeError("Failed to save scheduled posts atomically")
 
 def add_to_queue(new_posts: list):
     with _QUEUE_LOCK:
