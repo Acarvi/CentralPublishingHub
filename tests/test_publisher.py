@@ -299,7 +299,7 @@ def test_publish_now_concurrent_requests_execute_single_upload(monkeypatch):
         assert matching_posts[0]["result"] == canonical_result
 
 
-def test_recover_interrupted_posts_handles_immediate_processing(monkeypatch):
+def test_recover_interrupted_posts_handles_immediate_and_scheduled_processing(monkeypatch):
     import tempfile
     from pathlib import Path
     from core.publisher import recover_interrupted_posts, load_scheduled_posts, save_scheduled_posts
@@ -309,9 +309,9 @@ def test_recover_interrupted_posts_handles_immediate_processing(monkeypatch):
         monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
 
         posts = [
-            {"idempotency_key": "k1", "status": "immediate_processing"},
-            {"idempotency_key": "k2", "status": "processing"},
-            {"idempotency_key": "k3", "status": "published"},
+            {"idempotency_key": "k1", "scheduled_id": "sch-1", "client_job_id": "cli-1", "source_item_id": "src-1", "status": "immediate_processing"},
+            {"idempotency_key": "k2", "scheduled_id": "sch-2", "client_job_id": "cli-2", "source_item_id": "src-2", "status": "processing"},
+            {"idempotency_key": "k3", "scheduled_id": "sch-3", "client_job_id": "cli-3", "source_item_id": "src-3", "status": "published"},
         ]
         save_scheduled_posts(posts)
 
@@ -323,8 +323,21 @@ def test_recover_interrupted_posts_handles_immediate_processing(monkeypatch):
         assert posts_after[0]["status"] == "unknown"
         assert posts_after[0]["error"] == "immediate_publish_interrupted_requires_reconciliation"
         assert posts_after[0]["result"]["requires_reconciliation"] is True
-        assert posts_after[1]["status"] == "error"
-        assert posts_after[1]["error"] == "worker_restarted_before_completion"
+        assert posts_after[0]["requires_reconciliation"] is True
+        assert posts_after[0]["idempotency_key"] == "k1"
+        assert posts_after[0]["scheduled_id"] == "sch-1"
+
+        # scheduled processing MUST ALSO become unknown, NOT error/retryable
+        assert posts_after[1]["status"] == "unknown"
+        assert posts_after[1]["error"] == "scheduled_publish_interrupted_requires_reconciliation"
+        assert posts_after[1]["result"]["requires_reconciliation"] is True
+        assert posts_after[1]["requires_reconciliation"] is True
+        assert posts_after[1]["idempotency_key"] == "k2"
+        assert posts_after[1]["scheduled_id"] == "sch-2"
+        assert posts_after[1]["client_job_id"] == "cli-2"
+        assert posts_after[1]["source_item_id"] == "src-2"
+
+        # published post is untouched
         assert posts_after[2]["status"] == "published"
 
 
@@ -399,23 +412,281 @@ def test_get_queue(mock_load):
     assert queue[0]["status"] == "pending"
 
 
-@patch("core.publisher.publish_item_local", return_value={"status": "success", "results": []})
-@patch("core.publisher.save_scheduled_posts")
-@patch("core.publisher.load_scheduled_posts")
-def test_process_due_posts_publishes_current_and_expires_legacy(mock_load, mock_save, mock_publish):
-    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
-    posts = [
-        {"status": "pending", "target_time": (now - timedelta(minutes=1)).isoformat()},
-        {"status": "pending", "target_time": (now - timedelta(days=2)).isoformat()},
-        {"status": "pending", "target_time": (now + timedelta(hours=1)).isoformat()},
-    ]
-    mock_load.side_effect = lambda: posts
+def test_process_due_posts_executes_overdue_and_respects_explicit_expiry_only(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from core.publisher import process_due_posts, load_scheduled_posts, save_scheduled_posts
 
-    assert process_due_posts(now) == 1
-    mock_publish.assert_called_once()
-    assert posts[0]["status"] == "published"
-    assert posts[1]["status"] == "expired"
-    assert posts[2]["status"] == "pending"
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        published_items = []
+        def mock_publish(post):
+            published_items.append(post["scheduled_id"])
+            return {"status": "success", "results": [{"platform": "instagram_reel", "success": True, "result": {"id": "123"}}]}
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish)
+
+        now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        posts = [
+            # 1. Due slightly in past (5 min ago) -> MUST publish
+            {"scheduled_id": "due-5m", "status": "pending", "target_time": (now - timedelta(minutes=5)).isoformat()},
+            # 2. Overdue significantly (3 days ago) with NO explicit expiry -> MUST publish (not silently expired!)
+            {"scheduled_id": "overdue-3d", "status": "pending", "target_time": (now - timedelta(days=3)).isoformat()},
+            # 3. Future post (+2 hours) -> MUST NOT publish early
+            {"scheduled_id": "future-2h", "status": "pending", "target_time": (now + timedelta(hours=2)).isoformat()},
+            # 4. Overdue post WITH explicit expiry passed -> MUST expire
+            {
+                "scheduled_id": "explicit-expired",
+                "status": "pending",
+                "target_time": (now - timedelta(days=1)).isoformat(),
+                "expires_at": (now - timedelta(hours=1)).isoformat(),
+            },
+            # 5. Overdue post WITH explicit latest_publish_at in future -> MUST publish
+            {
+                "scheduled_id": "explicit-future-exp",
+                "status": "pending",
+                "target_time": (now - timedelta(minutes=30)).isoformat(),
+                "latest_publish_at": (now + timedelta(hours=1)).isoformat(),
+            },
+        ]
+        save_scheduled_posts(posts)
+
+        due_count = process_due_posts(now)
+        assert due_count == 3
+        assert published_items == ["due-5m", "overdue-3d", "explicit-future-exp"]
+
+        posts_after = load_scheduled_posts()
+        assert posts_after[0]["status"] == "published"
+        assert posts_after[1]["status"] == "published"
+        assert posts_after[2]["status"] == "pending"  # Future job remains pending
+        assert posts_after[3]["status"] == "expired"  # Explicitly expired
+        assert posts_after[3]["error"] == "schedule_explicitly_expired"
+        assert posts_after[4]["status"] == "published"
+
+
+def test_two_overdue_jobs_crash_simulation_claims_one_at_a_time(monkeypatch):
+    """
+    Mandatory senior review regression test exercising the REAL process_due_posts() claim path:
+    Two overdue jobs A and B.
+    Scheduler claims job A into 'processing' and persists it immediately.
+    A hard process termination (BaseException) occurs while job A is in flight.
+    Verify:
+    1. Persisted queue on disk at crash shows Job A == 'processing', Job B == 'pending'.
+    2. Restart recovery marks ONLY job A as 'unknown' / requires_reconciliation.
+    3. Job B remains pending and publishes successfully on the next scheduler cycle.
+    4. Job A is NOT automatically retried.
+    """
+    import tempfile
+    import pytest
+    from pathlib import Path
+    from core.publisher import process_due_posts, recover_interrupted_posts, load_scheduled_posts, save_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        posts = [
+            {
+                "scheduled_id": "job-A",
+                "idempotency_key": "idem-A",
+                "client_job_id": "cli-A",
+                "source_item_id": "src-A",
+                "status": "pending",
+                "target_time": (now - timedelta(hours=2)).isoformat(),
+                "caption": "Job A",
+                "platforms": ["instagram_reel"],
+            },
+            {
+                "scheduled_id": "job-B",
+                "idempotency_key": "idem-B",
+                "client_job_id": "cli-B",
+                "source_item_id": "src-B",
+                "status": "pending",
+                "target_time": (now - timedelta(hours=1)).isoformat(),
+                "caption": "Job B",
+                "platforms": ["instagram_reel"],
+            },
+        ]
+        save_scheduled_posts(posts)
+
+        # 1. Simulate abrupt hard process termination during Job A provider execution
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        def mock_publish_hard_crash(post):
+            if post["scheduled_id"] == "job-A":
+                # Process dies abruptly after process_due_posts() has claimed & persisted Job A as processing
+                raise SimulatedProcessDeath("Abrupt process crash during Job A execution")
+            return {"status": "success", "results": [{"platform": "instagram_reel", "success": True, "result": {"id": "ig_B"}}]}
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish_hard_crash)
+
+        # 2. Call the REAL process_due_posts() - it claims Job A into processing and saves to disk, then dies
+        with pytest.raises(SimulatedProcessDeath):
+            process_due_posts(now)
+
+        # 3. Read persisted queue immediately after simulated process death
+        queue_at_crash = load_scheduled_posts()
+        assert queue_at_crash[0]["scheduled_id"] == "job-A"
+        assert queue_at_crash[0]["status"] == "processing"
+        assert queue_at_crash[1]["scheduled_id"] == "job-B"
+        assert queue_at_crash[1]["status"] == "pending"  # Job B was untouched!
+
+        # 4. Hub process restarts after crash
+        recovered = recover_interrupted_posts()
+        assert recovered == 1
+
+        queue_after_recovery = load_scheduled_posts()
+        # Job A MUST become unknown (requiring reconciliation)
+        assert queue_after_recovery[0]["scheduled_id"] == "job-A"
+        assert queue_after_recovery[0]["status"] == "unknown"
+        assert queue_after_recovery[0]["error"] == "scheduled_publish_interrupted_requires_reconciliation"
+        assert queue_after_recovery[0]["requires_reconciliation"] is True
+
+        # Job B MUST STILL be pending!
+        assert queue_after_recovery[1]["scheduled_id"] == "job-B"
+        assert queue_after_recovery[1]["status"] == "pending"
+
+        # 5. Next scheduler cycle runs with healthy provider
+        published_items = []
+        def mock_publish_healthy(post):
+            published_items.append(post["scheduled_id"])
+            return {"status": "success", "results": [{"platform": "instagram_reel", "success": True, "result": {"id": "ig_B"}}]}
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish_healthy)
+
+        due_count = process_due_posts(now)
+        # Only Job B executes; Job A is NOT retried!
+        assert due_count == 1
+        assert published_items == ["job-B"]
+
+        queue_final = load_scheduled_posts()
+        # Job A remains unknown
+        assert queue_final[0]["status"] == "unknown"
+        assert queue_final[0]["scheduled_id"] == "job-A"
+        # Job B is published
+        assert queue_final[1]["status"] == "published"
+        assert queue_final[1]["scheduled_id"] == "job-B"
+
+
+def test_match_post_unlocked_stable_identifiers_contract():
+    """Verify _match_post_unlocked adheres strictly to stable identifier priority with no caption/position fallback."""
+    from core.publisher import _match_post_unlocked
+
+    # 1. Identical captions cannot cause cross-post confusion
+    posts_identical_captions = [
+        {"scheduled_id": "sch-1", "idempotency_key": "k-1", "caption": "Breaking News"},
+        {"scheduled_id": "sch-2", "idempotency_key": "k-2", "caption": "Breaking News"},
+    ]
+    assert _match_post_unlocked(posts_identical_captions, {"scheduled_id": "sch-2"}) == 1
+    assert _match_post_unlocked(posts_identical_captions, {"scheduled_id": "sch-1"}) == 0
+    # A post with no matching stable IDs returns None even if caption matches
+    assert _match_post_unlocked(posts_identical_captions, {"scheduled_id": "sch-unknown", "caption": "Breaking News"}) is None
+
+    # 2. scheduled_id always wins over other identifiers
+    posts_mixed = [
+        {"scheduled_id": "sch-primary", "idempotency_key": "k-secondary", "source_item_id": "src-1"},
+        {"scheduled_id": "sch-other", "idempotency_key": "k-primary", "source_item_id": "src-2"},
+    ]
+    assert _match_post_unlocked(posts_mixed, {"scheduled_id": "sch-primary", "idempotency_key": "k-primary"}) == 0
+    assert _match_post_unlocked(posts_mixed, {"scheduled_id": "sch-other", "idempotency_key": "k-secondary"}) == 1
+
+    # 3. source_item_id fallback is rejected when ambiguous (multiple candidates)
+    posts_ambiguous_source = [
+        {"scheduled_id": "sch-10", "source_item_id": "shared-src-id"},
+        {"scheduled_id": "sch-20", "source_item_id": "shared-src-id"},
+    ]
+    assert _match_post_unlocked(posts_ambiguous_source, {"source_item_id": "shared-src-id"}) is None
+
+    # 4. source_item_id fallback succeeds ONLY when uniquely identifying a single post
+    posts_unique_source = [
+        {"scheduled_id": "sch-10", "source_item_id": "unique-src-1"},
+        {"scheduled_id": "sch-20", "source_item_id": "unique-src-2"},
+    ]
+    assert _match_post_unlocked(posts_unique_source, {"source_item_id": "unique-src-2"}) == 1
+
+
+def test_process_due_posts_handles_malformed_target_time_and_expiry(monkeypatch):
+    """Verify that malformed target_time and expiry fields result in visible terminal errors instead of hanging or publishing."""
+    import tempfile
+    from pathlib import Path
+    from core.publisher import process_due_posts, load_scheduled_posts, save_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        published_items = []
+        def mock_publish(post):
+            published_items.append(post["scheduled_id"])
+            return {"status": "success", "results": []}
+
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish)
+
+        now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        posts = [
+            # 1. Malformed target_time
+            {"scheduled_id": "bad-target", "status": "pending", "target_time": "not-a-valid-iso-date"},
+            # 2. Missing target_time
+            {"scheduled_id": "missing-target", "status": "pending", "target_time": None, "scheduled_at": None},
+            # 3. Malformed explicit expiry (expires_at) -> MUST NOT publish
+            {
+                "scheduled_id": "bad-expiry",
+                "status": "pending",
+                "target_time": (now - timedelta(minutes=10)).isoformat(),
+                "expires_at": "invalid-expiry-format",
+            },
+        ]
+        save_scheduled_posts(posts)
+
+        due_count = process_due_posts(now)
+        # None of the malformed jobs should be published
+        assert due_count == 0
+        assert published_items == []
+
+        posts_after = load_scheduled_posts()
+        # 1. Bad target time -> error
+        assert posts_after[0]["status"] == "error"
+        assert posts_after[0]["error"] == "invalid_schedule_target_time"
+        assert "Cannot parse target_time" in posts_after[0]["result"]["details"]
+
+        # 2. Missing target time -> error
+        assert posts_after[1]["status"] == "error"
+        assert posts_after[1]["error"] == "missing_schedule_target_time"
+
+        # 3. Bad expiry -> error (NOT published!)
+        assert posts_after[2]["status"] == "error"
+        assert posts_after[2]["error"] == "invalid_schedule_expiry"
+        assert "Cannot parse expiry" in posts_after[2]["result"]["details"]
+
+
+def test_repeated_scheduler_and_recovery_calls_remain_idempotent(monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from core.publisher import process_due_posts, recover_interrupted_posts, load_scheduled_posts, save_scheduled_posts
+
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+
+        posts = [
+            {"scheduled_id": "sch-pub-1", "idempotency_key": "k1", "status": "published", "result": {"status": "success"}},
+            {"scheduled_id": "sch-unk-1", "idempotency_key": "k2", "status": "unknown", "error": "interrupted"},
+            {"scheduled_id": "sch-exp-1", "idempotency_key": "k3", "status": "expired", "error": "schedule_explicitly_expired"},
+        ]
+        save_scheduled_posts(posts)
+
+        # Recovery on already stable posts recovers 0 and mutates nothing
+        assert recover_interrupted_posts() == 0
+        assert load_scheduled_posts() == posts
+
+        # Scheduler on non-pending posts executes 0 and mutates nothing
+        now = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        assert process_due_posts(now) == 0
+        assert load_scheduled_posts() == posts
 
 def test_requires_public_url_for_instagram_targets():
     assert requires_public_url(["instagram_reel"]) is True

@@ -256,87 +256,192 @@ def publish_now_with_idempotency(payload: dict[str, Any], wait_timeout_seconds: 
     return result
 
 
-def process_due_posts(now: datetime | None = None) -> int:
-    """Publish due queue entries and expire legacy entries instead of replaying them."""
-    now = now or datetime.now(timezone.utc)
-    due_indexes = []
-    with _QUEUE_LOCK:
-        posts = load_scheduled_posts()
-        changed = False
-        for index, post in enumerate(posts):
-            if post.get('status') == 'processing':
-                started_raw = str(post.get('started_at') or '').strip()
-                try:
-                    started = datetime.fromisoformat(started_raw.replace('Z', '+00:00'))
-                    if started.tzinfo is None:
-                        started = started.replace(tzinfo=timezone.utc)
-                    if (now - started).total_seconds() > 20 * 60:
-                        post['status'] = 'pending'
-                        post['started_at'] = None
-                        changed = True
-                except ValueError:
-                    post['status'] = 'pending'
-                    post['started_at'] = None
-                    changed = True
-                continue
-            if post.get('status') != 'pending':
-                continue
-            raw_target = post.get('target_time') or post.get('scheduled_at')
-            if not raw_target:
-                continue
-            try:
-                target = datetime.fromisoformat(raw_target.replace('Z', '+00:00'))
-                if target.tzinfo is None:
-                    target = target.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            if target > now:
-                continue
-            if (now - target).total_seconds() > 15 * 60:
-                post['status'] = 'expired'
-                post['error'] = 'legacy_schedule_expired'
-                changed = True
-                continue
-            post['status'] = 'processing'
-            post['started_at'] = now.isoformat(timespec='seconds')
-            due_indexes.append(index)
-            changed = True
-        if changed:
-            save_scheduled_posts(posts)
+def _match_post_unlocked(posts: list[dict[str, Any]], target: dict[str, Any]) -> int | None:
+    """
+    Find the index of a post in posts matching stable identifiers only in strict priority order:
+    1. scheduled_id
+    2. idempotency_key
+    3. client_job_id
+    4. source_item_id ONLY if it resolves uniquely
+    Never correlates by mutable list position, caption, title, or fuzzy content identity.
+    """
+    target_sch_id = str(target.get("scheduled_id") or "").strip()
+    target_idem_key = str(target.get("idempotency_key") or "").strip()
+    target_cli_id = str(target.get("client_job_id") or "").strip()
+    target_src_id = str(target.get("source_item_id") or "").strip()
 
-    for index in due_indexes:
+    # 1. Match by scheduled_id
+    if target_sch_id:
+        for idx, p in enumerate(posts):
+            if str(p.get("scheduled_id") or "").strip() == target_sch_id:
+                return idx
+
+    # 2. Match by idempotency_key
+    if target_idem_key:
+        for idx, p in enumerate(posts):
+            if str(p.get("idempotency_key") or "").strip() == target_idem_key:
+                return idx
+
+    # 3. Match by client_job_id
+    if target_cli_id:
+        for idx, p in enumerate(posts):
+            if str(p.get("client_job_id") or "").strip() == target_cli_id:
+                return idx
+
+    # 4. Match by source_item_id ONLY if it resolves uniquely
+    if target_src_id:
+        matching_indices = [
+            idx for idx, p in enumerate(posts)
+            if str(p.get("source_item_id") or "").strip() == target_src_id
+        ]
+        if len(matching_indices) == 1:
+            return matching_indices[0]
+
+    return None
+
+
+def process_due_posts(now: datetime | None = None) -> int:
+    """
+    Publish due queue entries one by one.
+    Claims ONLY the single actively executing job into 'processing' to prevent
+    unnecessary uncertainty for subsequent jobs during an interruption.
+    """
+    now = now or datetime.now(timezone.utc)
+    processed_count = 0
+
+    while True:
+        claimed_post: dict[str, Any] | None = None
+
         with _QUEUE_LOCK:
             posts = load_scheduled_posts()
-            post = dict(posts[index])
+            changed = False
+
+            for index, post in enumerate(posts):
+                if post.get("status") != "pending":
+                    continue
+
+                raw_target = post.get("target_time") or post.get("scheduled_at")
+                if not raw_target:
+                    post["status"] = "error"
+                    post["error"] = "missing_schedule_target_time"
+                    post["result"] = {
+                        "status": "error",
+                        "error": "missing_schedule_target_time",
+                        "details": "Post has no target_time or scheduled_at specified",
+                    }
+                    post["finished_at"] = now.isoformat(timespec="seconds")
+                    changed = True
+                    continue
+
+                try:
+                    target = datetime.fromisoformat(str(raw_target).replace("Z", "+00:00"))
+                    if target.tzinfo is None:
+                        target = target.replace(tzinfo=timezone.utc)
+                except Exception as exc:
+                    post["status"] = "error"
+                    post["error"] = "invalid_schedule_target_time"
+                    post["result"] = {
+                        "status": "error",
+                        "error": "invalid_schedule_target_time",
+                        "details": f"Cannot parse target_time '{raw_target}': {exc}",
+                    }
+                    post["finished_at"] = now.isoformat(timespec="seconds")
+                    changed = True
+                    continue
+
+                if target > now:
+                    continue
+
+                raw_expiry = post.get("expires_at") or post.get("latest_publish_at")
+                if raw_expiry:
+                    try:
+                        expiry = datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+                        if expiry.tzinfo is None:
+                            expiry = expiry.replace(tzinfo=timezone.utc)
+                    except Exception as exc:
+                        post["status"] = "error"
+                        post["error"] = "invalid_schedule_expiry"
+                        post["result"] = {
+                            "status": "error",
+                            "error": "invalid_schedule_expiry",
+                            "details": f"Cannot parse expiry '{raw_expiry}': {exc}",
+                        }
+                        post["finished_at"] = now.isoformat(timespec="seconds")
+                        changed = True
+                        continue
+
+                    if now > expiry:
+                        post["status"] = "expired"
+                        post["error"] = "schedule_explicitly_expired"
+                        post["result"] = {
+                            "status": "expired",
+                            "error": "schedule_explicitly_expired",
+                            "details": f"Current time {now.isoformat()} is after explicit expiry {expiry.isoformat()}",
+                        }
+                        post["finished_at"] = now.isoformat(timespec="seconds")
+                        changed = True
+                        continue
+
+                # Found the single due job to claim: claim ONLY this one
+                post["status"] = "processing"
+                post["started_at"] = now.isoformat(timespec="seconds")
+                claimed_post = dict(post)
+                changed = True
+                break
+
+            if changed:
+                save_scheduled_posts(posts)
+
+        if not claimed_post:
+            break
+
+        # Execute provider call OUTSIDE _QUEUE_LOCK
         try:
-            result = publish_item_local(post)
+            result = publish_item_local(claimed_post)
         except Exception as exc:
-            # Never leave a due item stuck in `processing` when one platform
-            # raises unexpectedly; persist a visible failure instead.
             result = {
                 "status": "error",
                 "error": "worker_exception",
                 "details": str(exc),
             }
-        success = result.get('status') == 'success'
+
+        success = result.get("status") == "success"
+
+        # Update post outcome under _QUEUE_LOCK using stable identifiers only
         with _QUEUE_LOCK:
             posts = load_scheduled_posts()
-            posts[index]['status'] = 'published' if success else 'error'
-            posts[index]['result'] = result
-            posts[index]['finished_at'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
-            save_scheduled_posts(posts)
-    return len(due_indexes)
+            match_idx = _match_post_unlocked(posts, claimed_post)
+            if match_idx is not None:
+                posts[match_idx]["status"] = "published" if success else "error"
+                posts[match_idx]["result"] = result
+                posts[match_idx]["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                save_scheduled_posts(posts)
+            else:
+                log_print(
+                    f"Warning: Claimed post {claimed_post.get('scheduled_id')} could not be matched by stable identifiers for final update.",
+                    "WARN"
+                )
+
+        processed_count += 1
+
+    return processed_count
 
 def recover_interrupted_posts() -> int:
-    """Mark jobs left in processing or immediate_processing by a previous process as actionable errors or unknown states requiring reconciliation."""
+    """Mark jobs left in processing or immediate_processing by a previous process as unknown states requiring reconciliation."""
     with _QUEUE_LOCK:
         posts = load_scheduled_posts()
         recovered = 0
         for post in posts:
             st = str(post.get("status") or "").strip()
             if st == "processing":
-                post["status"] = "error"
-                post["error"] = "worker_restarted_before_completion"
+                post["status"] = "unknown"
+                post["error"] = "scheduled_publish_interrupted_requires_reconciliation"
+                post["result"] = {
+                    "status": "unknown",
+                    "error": "scheduled_publish_interrupted_requires_reconciliation",
+                    "requires_reconciliation": True,
+                }
+                post["requires_reconciliation"] = True
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
             elif st == "immediate_processing":
@@ -347,6 +452,7 @@ def recover_interrupted_posts() -> int:
                     "error": "immediate_publish_interrupted_requires_reconciliation",
                     "requires_reconciliation": True,
                 }
+                post["requires_reconciliation"] = True
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
         if recovered:

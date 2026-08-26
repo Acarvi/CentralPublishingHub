@@ -1,7 +1,17 @@
 import pytest
+import tempfile
+from pathlib import Path
 from httpx import AsyncClient, ASGITransport
 from main import app
 from unittest.mock import patch
+
+
+@pytest.fixture(autouse=True)
+def clean_posts_file(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        target_file = Path(td) / "scheduled_posts.json"
+        monkeypatch.setattr("core.publisher.SCHEDULED_POSTS_FILE", str(target_file))
+        yield target_file
 
 @pytest.mark.asyncio
 async def test_read_root():

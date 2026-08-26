@@ -28,7 +28,7 @@ async def lifespan(_app: FastAPI):
     _scheduler_stop.clear()
     recovered = recover_interrupted_posts()
     if recovered:
-        print(f'[WARN] {recovered} trabajos interrumpidos marcados como error.')
+        print(f'[WARN] {recovered} trabajos interrumpidos marcados como unknown (requieren conciliación).')
     worker = threading.Thread(target=scheduler_loop, args=(_scheduler_stop,), daemon=True)
     worker.start()
     yield
