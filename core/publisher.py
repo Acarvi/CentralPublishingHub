@@ -257,7 +257,7 @@ def publish_now_with_idempotency(payload: dict[str, Any], wait_timeout_seconds: 
 
 
 def process_due_posts(now: datetime | None = None) -> int:
-    """Publish due queue entries and expire legacy entries instead of replaying them."""
+    """Publish due queue entries and support explicit expiry policies without silent overdue loss."""
     now = now or datetime.now(timezone.utc)
     due_indexes = []
     with _QUEUE_LOCK:
@@ -265,19 +265,6 @@ def process_due_posts(now: datetime | None = None) -> int:
         changed = False
         for index, post in enumerate(posts):
             if post.get('status') == 'processing':
-                started_raw = str(post.get('started_at') or '').strip()
-                try:
-                    started = datetime.fromisoformat(started_raw.replace('Z', '+00:00'))
-                    if started.tzinfo is None:
-                        started = started.replace(tzinfo=timezone.utc)
-                    if (now - started).total_seconds() > 20 * 60:
-                        post['status'] = 'pending'
-                        post['started_at'] = None
-                        changed = True
-                except ValueError:
-                    post['status'] = 'pending'
-                    post['started_at'] = None
-                    changed = True
                 continue
             if post.get('status') != 'pending':
                 continue
@@ -292,11 +279,19 @@ def process_due_posts(now: datetime | None = None) -> int:
                 continue
             if target > now:
                 continue
-            if (now - target).total_seconds() > 15 * 60:
-                post['status'] = 'expired'
-                post['error'] = 'legacy_schedule_expired'
-                changed = True
-                continue
+            raw_expiry = post.get('expires_at') or post.get('latest_publish_at')
+            if raw_expiry:
+                try:
+                    expiry = datetime.fromisoformat(str(raw_expiry).replace('Z', '+00:00'))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if now > expiry:
+                        post['status'] = 'expired'
+                        post['error'] = 'schedule_explicitly_expired'
+                        changed = True
+                        continue
+                except ValueError:
+                    pass
             post['status'] = 'processing'
             post['started_at'] = now.isoformat(timespec='seconds')
             due_indexes.append(index)
@@ -328,15 +323,21 @@ def process_due_posts(now: datetime | None = None) -> int:
     return len(due_indexes)
 
 def recover_interrupted_posts() -> int:
-    """Mark jobs left in processing or immediate_processing by a previous process as actionable errors or unknown states requiring reconciliation."""
+    """Mark jobs left in processing or immediate_processing by a previous process as unknown states requiring reconciliation."""
     with _QUEUE_LOCK:
         posts = load_scheduled_posts()
         recovered = 0
         for post in posts:
             st = str(post.get("status") or "").strip()
             if st == "processing":
-                post["status"] = "error"
-                post["error"] = "worker_restarted_before_completion"
+                post["status"] = "unknown"
+                post["error"] = "scheduled_publish_interrupted_requires_reconciliation"
+                post["result"] = {
+                    "status": "unknown",
+                    "error": "scheduled_publish_interrupted_requires_reconciliation",
+                    "requires_reconciliation": True,
+                }
+                post["requires_reconciliation"] = True
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
             elif st == "immediate_processing":
@@ -347,6 +348,7 @@ def recover_interrupted_posts() -> int:
                     "error": "immediate_publish_interrupted_requires_reconciliation",
                     "requires_reconciliation": True,
                 }
+                post["requires_reconciliation"] = True
                 post["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 recovered += 1
         if recovered:
