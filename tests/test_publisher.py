@@ -468,17 +468,18 @@ def test_process_due_posts_executes_overdue_and_respects_explicit_expiry_only(mo
 
 def test_two_overdue_jobs_crash_simulation_claims_one_at_a_time(monkeypatch):
     """
-    Mandatory senior review regression test:
+    Mandatory senior review regression test exercising the REAL process_due_posts() claim path:
     Two overdue jobs A and B.
-    Scheduler claims job A into 'processing'.
-    Process crashes/dies abruptly while job A is in flight.
+    Scheduler claims job A into 'processing' and persists it immediately.
+    A hard process termination (BaseException) occurs while job A is in flight.
     Verify:
-    1. Job B was NEVER marked processing and remained 'pending'.
+    1. Persisted queue on disk at crash shows Job A == 'processing', Job B == 'pending'.
     2. Restart recovery marks ONLY job A as 'unknown' / requires_reconciliation.
     3. Job B remains pending and publishes successfully on the next scheduler cycle.
     4. Job A is NOT automatically retried.
     """
     import tempfile
+    import pytest
     from pathlib import Path
     from core.publisher import process_due_posts, recover_interrupted_posts, load_scheduled_posts, save_scheduled_posts
 
@@ -511,28 +512,30 @@ def test_two_overdue_jobs_crash_simulation_claims_one_at_a_time(monkeypatch):
         ]
         save_scheduled_posts(posts)
 
-        # 1. Simulate process executing Job A and crashing before writing final result
-        class SimulatedCrashError(Exception):
+        # 1. Simulate abrupt hard process termination during Job A provider execution
+        class SimulatedProcessDeath(BaseException):
             pass
 
-        def mock_publish_crash(post):
+        def mock_publish_hard_crash(post):
             if post["scheduled_id"] == "job-A":
-                # Crash immediately after claim while Job A is in-flight
-                raise SimulatedCrashError("Abrupt process crash during Job A")
+                # Process dies abruptly after process_due_posts() has claimed & persisted Job A as processing
+                raise SimulatedProcessDeath("Abrupt process crash during Job A execution")
             return {"status": "success", "results": [{"platform": "instagram_reel", "success": True, "result": {"id": "ig_B"}}]}
 
-        # When publish_item_local raises, process_due_posts catches worker_exception,
-        # but to simulate a full process crash/death during execution where final save never happens,
-        # we can simulate the state on disk after Job A is claimed:
-        # Job A claimed as 'processing' (saved by process_due_posts claim step)
-        # Job B was untouched in queue as 'pending'
-        queue_at_crash = [
-            dict(posts[0], status="processing", started_at=now.isoformat()),
-            dict(posts[1], status="pending"),
-        ]
-        save_scheduled_posts(queue_at_crash)
+        monkeypatch.setattr("core.publisher.publish_item_local", mock_publish_hard_crash)
 
-        # 2. Hub process restarts after crash
+        # 2. Call the REAL process_due_posts() - it claims Job A into processing and saves to disk, then dies
+        with pytest.raises(SimulatedProcessDeath):
+            process_due_posts(now)
+
+        # 3. Read persisted queue immediately after simulated process death
+        queue_at_crash = load_scheduled_posts()
+        assert queue_at_crash[0]["scheduled_id"] == "job-A"
+        assert queue_at_crash[0]["status"] == "processing"
+        assert queue_at_crash[1]["scheduled_id"] == "job-B"
+        assert queue_at_crash[1]["status"] == "pending"  # Job B was untouched!
+
+        # 4. Hub process restarts after crash
         recovered = recover_interrupted_posts()
         assert recovered == 1
 
@@ -547,7 +550,7 @@ def test_two_overdue_jobs_crash_simulation_claims_one_at_a_time(monkeypatch):
         assert queue_after_recovery[1]["scheduled_id"] == "job-B"
         assert queue_after_recovery[1]["status"] == "pending"
 
-        # 3. Next scheduler cycle runs
+        # 5. Next scheduler cycle runs with healthy provider
         published_items = []
         def mock_publish_healthy(post):
             published_items.append(post["scheduled_id"])
@@ -567,6 +570,43 @@ def test_two_overdue_jobs_crash_simulation_claims_one_at_a_time(monkeypatch):
         # Job B is published
         assert queue_final[1]["status"] == "published"
         assert queue_final[1]["scheduled_id"] == "job-B"
+
+
+def test_match_post_unlocked_stable_identifiers_contract():
+    """Verify _match_post_unlocked adheres strictly to stable identifier priority with no caption/position fallback."""
+    from core.publisher import _match_post_unlocked
+
+    # 1. Identical captions cannot cause cross-post confusion
+    posts_identical_captions = [
+        {"scheduled_id": "sch-1", "idempotency_key": "k-1", "caption": "Breaking News"},
+        {"scheduled_id": "sch-2", "idempotency_key": "k-2", "caption": "Breaking News"},
+    ]
+    assert _match_post_unlocked(posts_identical_captions, {"scheduled_id": "sch-2"}) == 1
+    assert _match_post_unlocked(posts_identical_captions, {"scheduled_id": "sch-1"}) == 0
+    # A post with no matching stable IDs returns None even if caption matches
+    assert _match_post_unlocked(posts_identical_captions, {"scheduled_id": "sch-unknown", "caption": "Breaking News"}) is None
+
+    # 2. scheduled_id always wins over other identifiers
+    posts_mixed = [
+        {"scheduled_id": "sch-primary", "idempotency_key": "k-secondary", "source_item_id": "src-1"},
+        {"scheduled_id": "sch-other", "idempotency_key": "k-primary", "source_item_id": "src-2"},
+    ]
+    assert _match_post_unlocked(posts_mixed, {"scheduled_id": "sch-primary", "idempotency_key": "k-primary"}) == 0
+    assert _match_post_unlocked(posts_mixed, {"scheduled_id": "sch-other", "idempotency_key": "k-secondary"}) == 1
+
+    # 3. source_item_id fallback is rejected when ambiguous (multiple candidates)
+    posts_ambiguous_source = [
+        {"scheduled_id": "sch-10", "source_item_id": "shared-src-id"},
+        {"scheduled_id": "sch-20", "source_item_id": "shared-src-id"},
+    ]
+    assert _match_post_unlocked(posts_ambiguous_source, {"source_item_id": "shared-src-id"}) is None
+
+    # 4. source_item_id fallback succeeds ONLY when uniquely identifying a single post
+    posts_unique_source = [
+        {"scheduled_id": "sch-10", "source_item_id": "unique-src-1"},
+        {"scheduled_id": "sch-20", "source_item_id": "unique-src-2"},
+    ]
+    assert _match_post_unlocked(posts_unique_source, {"source_item_id": "unique-src-2"}) == 1
 
 
 def test_process_due_posts_handles_malformed_target_time_and_expiry(monkeypatch):

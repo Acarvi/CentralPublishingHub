@@ -256,34 +256,46 @@ def publish_now_with_idempotency(payload: dict[str, Any], wait_timeout_seconds: 
     return result
 
 
-def _match_post_unlocked(posts: list[dict[str, Any]], target: dict[str, Any], hint_index: int | None = None) -> int | None:
-    """Find the index of a post in posts matching stable identifiers or hint_index."""
+def _match_post_unlocked(posts: list[dict[str, Any]], target: dict[str, Any]) -> int | None:
+    """
+    Find the index of a post in posts matching stable identifiers only in strict priority order:
+    1. scheduled_id
+    2. idempotency_key
+    3. client_job_id
+    4. source_item_id ONLY if it resolves uniquely
+    Never correlates by mutable list position, caption, title, or fuzzy content identity.
+    """
     target_sch_id = str(target.get("scheduled_id") or "").strip()
     target_idem_key = str(target.get("idempotency_key") or "").strip()
     target_cli_id = str(target.get("client_job_id") or "").strip()
     target_src_id = str(target.get("source_item_id") or "").strip()
 
+    # 1. Match by scheduled_id
     if target_sch_id:
         for idx, p in enumerate(posts):
             if str(p.get("scheduled_id") or "").strip() == target_sch_id:
                 return idx
 
+    # 2. Match by idempotency_key
     if target_idem_key:
         for idx, p in enumerate(posts):
             if str(p.get("idempotency_key") or "").strip() == target_idem_key:
                 return idx
 
+    # 3. Match by client_job_id
     if target_cli_id:
         for idx, p in enumerate(posts):
             if str(p.get("client_job_id") or "").strip() == target_cli_id:
                 return idx
 
-    if hint_index is not None and 0 <= hint_index < len(posts):
-        p = posts[hint_index]
-        if target_src_id and str(p.get("source_item_id") or "").strip() == target_src_id:
-            return hint_index
-        if p.get("caption") == target.get("caption"):
-            return hint_index
+    # 4. Match by source_item_id ONLY if it resolves uniquely
+    if target_src_id:
+        matching_indices = [
+            idx for idx, p in enumerate(posts)
+            if str(p.get("source_item_id") or "").strip() == target_src_id
+        ]
+        if len(matching_indices) == 1:
+            return matching_indices[0]
 
     return None
 
@@ -299,7 +311,6 @@ def process_due_posts(now: datetime | None = None) -> int:
 
     while True:
         claimed_post: dict[str, Any] | None = None
-        claimed_index: int | None = None
 
         with _QUEUE_LOCK:
             posts = load_scheduled_posts()
@@ -375,7 +386,6 @@ def process_due_posts(now: datetime | None = None) -> int:
                 post["status"] = "processing"
                 post["started_at"] = now.isoformat(timespec="seconds")
                 claimed_post = dict(post)
-                claimed_index = index
                 changed = True
                 break
 
@@ -397,15 +407,20 @@ def process_due_posts(now: datetime | None = None) -> int:
 
         success = result.get("status") == "success"
 
-        # Update post outcome under _QUEUE_LOCK using stable identifiers
+        # Update post outcome under _QUEUE_LOCK using stable identifiers only
         with _QUEUE_LOCK:
             posts = load_scheduled_posts()
-            match_idx = _match_post_unlocked(posts, claimed_post, hint_index=claimed_index)
+            match_idx = _match_post_unlocked(posts, claimed_post)
             if match_idx is not None:
                 posts[match_idx]["status"] = "published" if success else "error"
                 posts[match_idx]["result"] = result
                 posts[match_idx]["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 save_scheduled_posts(posts)
+            else:
+                log_print(
+                    f"Warning: Claimed post {claimed_post.get('scheduled_id')} could not be matched by stable identifiers for final update.",
+                    "WARN"
+                )
 
         processed_count += 1
 
