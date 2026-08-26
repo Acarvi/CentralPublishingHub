@@ -35,6 +35,8 @@ class PostPayload(BaseModel):
     source_account: Optional[str] = None
     publish_mode: Optional[str] = None
     scheduled_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    latest_publish_at: Optional[str] = None
 
 class SchedulePayload(BaseModel):
     posts: List[PostPayload]
